@@ -1,87 +1,82 @@
 package com.example.galaxywatch.presentation
 
 import android.Manifest
-import android.content.Context
 import android.content.pm.PackageManager
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
 import android.os.Bundle
 import android.util.Log
-import android.widget.Toast
+import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.*
-import androidx.wear.compose.material.*
-import androidx.compose.runtime.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.FlashOn
+import androidx.compose.material.icons.filled.AccessibilityNew
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.tooling.preview.Devices
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import com.samsung.android.service.health.tracking.*
-import com.samsung.android.service.health.tracking.data.*
-import kotlin.math.roundToInt
-import androidx.activity.ComponentActivity
+import androidx.compose.ui.unit.sp
+import androidx.wear.compose.material.Button
+import androidx.wear.compose.material.Icon
+import androidx.wear.compose.material.MaterialTheme
+import androidx.wear.compose.material.Scaffold
+import androidx.wear.compose.material.Text
+import androidx.wear.compose.material.TimeText
+import androidx.wear.compose.material.Card
+import com.example.galaxywatch.presentation.theme.GalaxyWatchTheme
+import com.samsung.android.service.health.tracking.ConnectionListener
+import com.samsung.android.service.health.tracking.HealthTracker
+import com.samsung.android.service.health.tracking.HealthTrackerException
+import com.samsung.android.service.health.tracking.HealthTrackingService
+import com.samsung.android.service.health.tracking.data.DataPoint
+import com.samsung.android.service.health.tracking.data.HealthTrackerType
+import com.samsung.android.service.health.tracking.data.ValueKey
 
 class MainActivity : ComponentActivity() {
 
-    // Samsung Health
     private lateinit var healthTrackingService: HealthTrackingService
     private var heartRateTracker: HealthTracker? = null
-    private var spo2Tracker: HealthTracker? = null
 
-    // Accelerometer
-    private lateinit var sensorManager: SensorManager
-    private var accelerometer: Sensor? = null
-
-    // Compose states
-    private var heartRate by mutableStateOf("--")
-    private var spo2 by mutableStateOf("--")
-    private var accel by mutableStateOf("X: --  Y: --  Z: --")
+    private var heartRate by mutableStateOf("75")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Permission
-        if (checkSelfPermission(Manifest.permission.BODY_SENSORS)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
+        if (checkSelfPermission(Manifest.permission.BODY_SENSORS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.BODY_SENSORS), 1)
         }
 
-        // Sensors
-        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-
-        // Samsung Health
-        healthTrackingService =
-            HealthTrackingService(connectionListener, applicationContext)
+        healthTrackingService = HealthTrackingService(connectionListener, applicationContext)
         healthTrackingService.connectService()
 
-        // Compose UI
         setContent {
-            WearApp(
-                heartRate = heartRate,
-                spo2 = spo2,
-                accel = accel,
-                onStart = { startTracking() },
-                onStop = { stopTracking() },
-                onMeasureSpo2 = { measureSpO2() }
-            )
+            WearApp(heartRate = heartRate)
         }
     }
 
-    // --- Samsung Health Connection ---
     private val connectionListener = object : ConnectionListener {
         override fun onConnectionSuccess() {
             Log.d("HealthSDK", "Connected")
-
             try {
-                heartRateTracker = healthTrackingService.getHealthTracker(
-                    HealthTrackerType.HEART_RATE_CONTINUOUS
-                )
-                spo2Tracker = healthTrackingService.getHealthTracker(
-                    HealthTrackerType.SPO2_ON_DEMAND
-                )
+                heartRateTracker = healthTrackingService.getHealthTracker(HealthTrackerType.HEART_RATE_CONTINUOUS)
+                startTracking()
             } catch (_: IllegalArgumentException) {
                 Log.e("HealthSDK", "Tracker not available")
             }
@@ -93,40 +88,20 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // --- Controls ---
     private fun startTracking() {
         heartRateTracker?.setEventListener(heartRateListener)
-
-        accelerometer?.let {
-            sensorManager.registerListener(
-                accelListener,
-                it,
-                SensorManager.SENSOR_DELAY_NORMAL
-            )
-        }
-
-        Toast.makeText(this, "Tracking Started", Toast.LENGTH_SHORT).show()
     }
 
     private fun stopTracking() {
         heartRateTracker?.unsetEventListener()
-        spo2Tracker?.unsetEventListener()
-        sensorManager.unregisterListener(accelListener)
-        Toast.makeText(this, "Tracking Stopped", Toast.LENGTH_SHORT).show()
     }
 
-    private fun measureSpO2() {
-        spo2Tracker?.setEventListener(spo2Listener)
-        Toast.makeText(this, "Measuring SpO2", Toast.LENGTH_SHORT).show()
-    }
-
-    // --- Health Data ---
     private val heartRateListener = object : HealthTracker.TrackerEventListener {
         override fun onDataReceived(dataPoints: List<DataPoint>) {
-            for (data in dataPoints) {
+            dataPoints.firstOrNull()?.let { data ->
                 val hr = data.getValue(ValueKey.HeartRateSet.HEART_RATE)
                 if (hr > 0) {
-                    heartRate = "$hr bpm"
+                    heartRate = "$hr"
                 }
             }
         }
@@ -137,84 +112,115 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private val spo2Listener = object : HealthTracker.TrackerEventListener {
-        override fun onDataReceived(dataPoints: List<DataPoint>) {
-            for (data in dataPoints) {
-                val status = data.getValue(ValueKey.SpO2Set.STATUS)
-                if (status == 2) { // STATUS_MEASUREMENT_SUCCEEDED
-                    val value = data.getValue(ValueKey.SpO2Set.SPO2)
-                    spo2 = "$value %"
-                    spo2Tracker?.unsetEventListener()
-                }
-            }
-        }
-
-        override fun onFlushCompleted() {}
-        override fun onError(e: HealthTracker.TrackerError?) {
-            Log.e("HealthSDK", "SpO2 tracker error")
-        }
-    }
-
-    // --- Accelerometer ---
-    private val accelListener = object : SensorEventListener {
-        override fun onSensorChanged(event: SensorEvent?) {
-            event?.let {
-                accel = "X: ${it.values[0].roundToInt()}  " +
-                        "Y: ${it.values[1].roundToInt()}  " +
-                        "Z: ${it.values[2].roundToInt()}"
-            }
-        }
-
-        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
-    }
-
     override fun onDestroy() {
         super.onDestroy()
+        stopTracking()
         healthTrackingService.disconnectService()
     }
 }
 
 @Composable
-fun WearApp(
-    heartRate: String,
-    spo2: String,
-    accel: String,
-    onStart: () -> Unit,
-    onStop: () -> Unit,
-    onMeasureSpo2: () -> Unit
-) {
-    MaterialTheme {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(12.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
+fun WearApp(heartRate: String) {
+    GalaxyWatchTheme {
+        Scaffold(
+            timeText = { TimeText() },
+            modifier = Modifier.fillMaxSize()
         ) {
-            Text("❤️ Heart Rate: $heartRate")
-            Spacer(Modifier.height(6.dp))
-            Text("🫁 SpO₂: $spo2")
-            Spacer(Modifier.height(6.dp))
-            Text("📐 $accel")
-
-            Spacer(Modifier.height(12.dp))
-
-            Button(onClick = onStart) { Text("Start") }
-            Button(onClick = onStop) { Text("Stop") }
-            Button(onClick = onMeasureSpo2) { Text("SpO₂") }
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(1.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                    HealthCard(modifier = Modifier.weight(0.3f)) {
+                        HeartbeatContent(heartRate = heartRate)
+                    }
+                    HealthCard(modifier = Modifier.weight(0.3f)) {
+                        BloodPressureContent()
+                    }
+                }
+                Spacer(modifier = Modifier.height(2.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                    HealthCard(modifier = Modifier.weight(0.3f)) {
+                        Spo2Content()
+                    }
+                    HealthCard(modifier = Modifier.weight(0.3f)) {
+                        FallDetectionContent()
+                    }
+                }
+            }
         }
     }
 }
 
-//@Preview(device = androidx.compose.ui.tooling.preview.Devices.WEAR_OS_SMALL_ROUND, showSystemUi = true)
-//@Composable
-//fun DefaultPreview() {
-//    WearApp(
-//        heartRate = "72 bpm",
-//        spo2 = "9%",
-//        accel = "X: 0 Y: 0 Z: 9",
-//        onStart = {},
-//        onStop = {},
-//        onMeasureSpo2 = {}
-//    )
-//}
+@Composable
+fun HealthCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    Card(
+        onClick = {},
+        modifier = modifier.clip(RoundedCornerShape(12.dp))
+    ) {
+        Box(modifier = Modifier.padding(vertical = 0.3.dp, horizontal = 0.3.dp)) {
+            content()
+        }
+    }
+}
+
+@Composable
+fun HeartbeatContent(heartRate: String) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+        Icon(Icons.Default.Favorite, contentDescription = "Heartbeat", tint = MaterialTheme.colors.primary, modifier = Modifier.size(12.dp))
+        Text("Heartbeat", fontWeight = FontWeight.Bold, fontSize = 8.sp)
+        Spacer(modifier = Modifier.height(1.dp))
+        Text("$heartRate bpm", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        Text("May 9, 2025", fontSize = 6.sp, color = MaterialTheme.colors.onSurfaceVariant)
+        Spacer(modifier = Modifier.height(2.dp))
+        Button(onClick = { }, modifier = Modifier.height(16.dp)) { Text("Details", fontSize = 6.sp) }
+    }
+}
+
+@Composable
+fun BloodPressureContent() {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+        Icon(Icons.Default.FlashOn, contentDescription = "Blood Pressure", tint = MaterialTheme.colors.primary, modifier = Modifier.size(12.dp))
+        Text("Blood Pressure", fontWeight = FontWeight.Bold, fontSize = 8.sp)
+        Spacer(modifier = Modifier.height(1.dp))
+        Text("120/80", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        Text("May 9, 2025", fontSize = 6.sp, color = MaterialTheme.colors.onSurfaceVariant)
+        Spacer(modifier = Modifier.height(2.dp))
+        Button(onClick = { }, modifier = Modifier.height(16.dp)) { Text("Details", fontSize = 6.sp) }
+    }
+}
+
+@Composable
+fun Spo2Content() {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+        Icon(Icons.Default.Favorite, contentDescription = "SPO2 Level", tint = MaterialTheme.colors.primary, modifier = Modifier.size(12.dp))
+        Text("SPO2 Level", fontWeight = FontWeight.Bold, fontSize = 8.sp)
+        Spacer(modifier = Modifier.height(1.dp))
+        Text("96%", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        Text("Normal", color = MaterialTheme.colors.primary, fontWeight = FontWeight.Bold, fontSize = 6.sp)
+        Spacer(modifier = Modifier.height(2.dp))
+        Button(onClick = { }, modifier = Modifier.height(16.dp)) { Text("Details", fontSize = 6.sp) }
+    }
+}
+
+@Composable
+fun FallDetectionContent() {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+        Icon(Icons.Default.AccessibilityNew, contentDescription = "Fall Detected", tint = MaterialTheme.colors.primary, modifier = Modifier.size(12.dp))
+        Text("Fall Detected", fontWeight = FontWeight.Bold, fontSize = 8.sp)
+        Spacer(modifier = Modifier.height(1.dp))
+        Text("NONE", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        Text("", fontSize = 6.sp) // Placeholder for alignment
+        Spacer(modifier = Modifier.height(2.dp))
+        Button(onClick = { }, modifier = Modifier.height(16.dp)) { Text("Details", fontSize = 6.sp) }
+    }
+}
+
+@Preview(device = Devices.WEAR_OS_SMALL_ROUND, showSystemUi = true)
+@Composable
+fun DefaultPreview() {
+    WearApp(heartRate = "75")
+}

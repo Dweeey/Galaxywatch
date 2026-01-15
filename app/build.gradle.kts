@@ -53,6 +53,7 @@ dependencies {
     implementation(files("libs/samsung-health-sensor-api-1.4.1.aar"))
     implementation("androidx.wear.compose:compose-material:1.3.0")
     implementation("androidx.wear.compose:compose-foundation:1.3.0")
+    implementation(libs.material.icons.extended)
     androidTestImplementation(platform(libs.compose.bom))
     androidTestImplementation(libs.ui.test.junit4)
     debugImplementation(libs.ui.tooling)
