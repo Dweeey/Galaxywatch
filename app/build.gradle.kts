@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.example.galaxywatch"
-    compileSdk = 34 // Use stable SDK 34 to avoid preview bugs
+    compileSdk = 35 // Use stable SDK 34 to avoid preview bugs
 
     defaultConfig {
         applicationId = "com.example.galaxywatch"
@@ -61,4 +61,7 @@ dependencies {
     // --- Debugging Tools ---
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
+    implementation("androidx.concurrent:concurrent-futures-ktx:1.1.0")
+    implementation("androidx.health.connect:connect-client:1.1.0-alpha07") // Check for latest version
+    implementation("androidx.health.connect:connect-client:1.1.0-alpha11")
 }
