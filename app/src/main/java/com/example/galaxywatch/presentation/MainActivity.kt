@@ -4,6 +4,10 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
@@ -17,10 +21,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccessibilityNew
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FlashOn
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
@@ -51,6 +57,7 @@ import java.text.SimpleDateFormat
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.*
+import kotlin.math.sqrt
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -110,7 +117,10 @@ fun MainAppLogic() {
 fun WearApp() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+
+    // Services
     val measureClient = remember { HealthServices.getClient(context).measureClient }
+    val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     val scope = rememberCoroutineScope()
 
     val healthConnectClient = remember {
@@ -122,11 +132,17 @@ fun WearApp() {
         }
     }
 
+    // --- STATE VARIABLES ---
     var heartRate by remember { mutableStateOf("...") }
     var spo2 by remember { mutableStateOf("--") }
     var currentTime by remember { mutableStateOf(getCurrentTime()) }
     var supportsHeartRate by remember { mutableStateOf<Boolean?>(null) }
 
+    // Fall Detection State
+    var fallDetected by remember { mutableStateOf(false) }
+    var fallMessage by remember { mutableStateOf("Scanning...") }
+
+    // --- 1. HEALTH CONNECT (SPO2 READ) ---
     LaunchedEffect(Unit) {
         try {
             val capabilities = measureClient.getCapabilitiesAsync().await()
@@ -158,6 +174,46 @@ fun WearApp() {
         }
     }
 
+    // --- 2. FALL DETECTION LOGIC (NEW) ---
+    DisposableEffect(Unit) {
+        val listener = object : SensorEventListener {
+            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+            override fun onSensorChanged(event: SensorEvent?) {
+                if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER) {
+                    val x = event.values[0]
+                    val y = event.values[1]
+                    val z = event.values[2]
+
+                    // Calculate Vector Magnitude (G-Force)
+                    val gForce = sqrt(x * x + y * y + z * z) / 9.81
+
+                    // THRESHOLD: If G-Force > 2.5, trigger fall
+                    if (gForce > 2.5) {
+                        fallDetected = true
+                        fallMessage = "DETECTED!"
+
+                        // Reset after 5 seconds
+                        scope.launch {
+                            delay(5000)
+                            fallDetected = false
+                            fallMessage = "Scanning..."
+                        }
+                    }
+                }
+            }
+        }
+
+        // Register Accelerometer
+        val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        sensorManager.registerListener(listener, accelerometer, SensorManager.SENSOR_DELAY_NORMAL)
+
+        onDispose {
+            sensorManager.unregisterListener(listener)
+        }
+    }
+
+    // --- 3. CLOCK LOOP ---
     LaunchedEffect(Unit) {
         while (true) {
             currentTime = getCurrentTime()
@@ -165,6 +221,7 @@ fun WearApp() {
         }
     }
 
+    // --- 4. HEART RATE LOGIC ---
     LaunchedEffect(supportsHeartRate) {
         if (supportsHeartRate == false) {
             heartRate = "N/A"
@@ -189,6 +246,7 @@ fun WearApp() {
         }
     }
 
+    // --- UI LAYOUT ---
     Scaffold(
         timeText = { TimeText() },
         modifier = Modifier.fillMaxSize()
@@ -211,8 +269,13 @@ fun WearApp() {
                 HealthCard(modifier = Modifier.weight(0.3f)) {
                     Spo2Content(spo2 = spo2)
                 }
-                HealthCard(modifier = Modifier.weight(0.3f)) {
-                    FallDetectionContent()
+
+                // UPDATED FALL DETECTION CARD
+                HealthCard(
+                    modifier = Modifier.weight(0.3f),
+                    backgroundColor = if (fallDetected) Color.Red else MaterialTheme.colors.surface
+                ) {
+                    FallDetectionContent(isFallDetected = fallDetected, statusMessage = fallMessage)
                 }
             }
         }
@@ -222,37 +285,30 @@ fun WearApp() {
 // --- HELPER FUNCTIONS ---
 
 fun launchSamsungHealthSpo2(context: Context) {
-    // FIX: Check BOTH possible package names
     val packages = listOf(
-        "com.sec.android.app.shealth",       // Phone/Standard version
-        "com.samsung.android.wear.shealth"   // Wear OS specific version
+        "com.sec.android.app.shealth",
+        "com.samsung.android.wear.shealth"
     )
-
     val deepLink = "shealth://oxygen_saturation"
     var appFound = false
 
     for (packageName in packages) {
         try {
-            // Check if this package exists on the watch
             val launchIntent = context.packageManager.getLaunchIntentForPackage(packageName)
             if (launchIntent != null) {
                 appFound = true
-                // Try Deep Link first
                 try {
                     val intent = Intent(Intent.ACTION_VIEW, Uri.parse(deepLink))
                     intent.setPackage(packageName)
                     intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
                     context.startActivity(intent)
-                    return // Success! Stop here.
+                    return
                 } catch (e: Exception) {
-                    // Deep link failed, just open the app normally
                     context.startActivity(launchIntent)
-                    return // Success! Stop here.
+                    return
                 }
             }
-        } catch (e: Exception) {
-            // Continue to next package
-        }
+        } catch (e: Exception) { }
     }
 
     if (!appFound) {
@@ -289,10 +345,19 @@ fun getCurrentTime(): String {
 // --- COMPOSABLES ---
 
 @Composable
-fun HealthCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+fun HealthCard(
+    modifier: Modifier = Modifier,
+    backgroundColor: Color = MaterialTheme.colors.surface,
+    content: @Composable () -> Unit
+) {
     Card(
         onClick = {},
-        modifier = modifier.clip(RoundedCornerShape(12.dp))
+        modifier = modifier.clip(RoundedCornerShape(12.dp)),
+        // We use backgroundPainter to handle color changes dynamically
+        backgroundPainter = CardDefaults.cardBackgroundPainter(
+            startBackgroundColor = backgroundColor,
+            endBackgroundColor = backgroundColor
+        )
     ) {
         Box(modifier = Modifier.padding(2.dp)) {
             content()
@@ -343,11 +408,26 @@ fun BloodPressureContent() {
 }
 
 @Composable
-fun FallDetectionContent() {
+fun FallDetectionContent(isFallDetected: Boolean, statusMessage: String) {
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-        Icon(Icons.Default.AccessibilityNew, "Fall", tint = MaterialTheme.colors.primary, modifier = Modifier.size(12.dp))
-        Text("Fall Detected", fontWeight = FontWeight.Bold, fontSize = 8.sp)
+        Icon(
+            if (isFallDetected) Icons.Default.Warning else Icons.Default.AccessibilityNew,
+            "Fall",
+            tint = if (isFallDetected) Color.White else MaterialTheme.colors.primary,
+            modifier = Modifier.size(12.dp)
+        )
+        Text(
+            "Fall Status",
+            fontWeight = FontWeight.Bold,
+            fontSize = 8.sp,
+            color = if (isFallDetected) Color.White else MaterialTheme.colors.onSurface
+        )
         Spacer(modifier = Modifier.height(1.dp))
-        Text("NONE", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        Text(
+            statusMessage,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold,
+            color = if (isFallDetected) Color.White else MaterialTheme.colors.onSurface
+        )
     }
 }
