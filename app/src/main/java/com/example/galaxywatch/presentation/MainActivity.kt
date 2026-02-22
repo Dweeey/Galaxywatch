@@ -1,6 +1,7 @@
 package com.example.galaxywatch.presentation
 
 import android.Manifest
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -11,6 +12,7 @@ import android.hardware.SensorManager
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -32,7 +34,6 @@ import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.concurrent.futures.await
 import androidx.core.content.ContextCompat
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.permission.HealthPermission
@@ -47,11 +48,15 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.wear.compose.material.*
 import com.example.galaxywatch.presentation.theme.GalaxyWatchTheme
+import com.google.firebase.firestore.ktx.firestore
+import com.google.firebase.ktx.Firebase
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.guava.await // Required for MeasureClient capabilities
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withTimeoutOrNull
 import java.text.SimpleDateFormat
 import java.time.Instant
@@ -63,16 +68,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // 1. Basic Sensor Permissions Launcher
         val permissionLauncher = registerForActivityResult(
             ActivityResultContracts.RequestPermission()
         ) { isGranted ->
-            setContent { MainAppLogic() }
-        }
-
-        val healthConnectPermissionLauncher = registerForActivityResult(
-            ActivityResultContracts.RequestMultiplePermissions()
-        ) { permissions ->
-            // handled in UI
+            if (isGranted) checkHealthConnectPermissions()
+            else Toast.makeText(this, "Body Sensor permission denied", Toast.LENGTH_SHORT).show()
         }
 
         setContent {
@@ -85,23 +86,24 @@ class MainActivity : ComponentActivity() {
                 LaunchedEffect(Unit) {
                     permissionLauncher.launch(Manifest.permission.BODY_SENSORS)
                 }
-            }
-
-            LaunchedEffect(Unit) {
-                try {
-                    val client = HealthConnectClient.getOrCreate(this@MainActivity)
-                    val permissions = setOf(
-                        HealthPermission.getReadPermission(OxygenSaturationRecord::class)
-                    )
-                    if (!client.permissionController.getGrantedPermissions().containsAll(permissions)) {
-                        healthConnectPermissionLauncher.launch(permissions.toTypedArray())
-                    }
-                } catch (e: Exception) {
-                    Log.e("MainActivity", "Health Connect not available", e)
-                }
+            } else {
+                LaunchedEffect(Unit) { checkHealthConnectPermissions() }
             }
 
             MainAppLogic()
+        }
+    }
+
+    // 2. Health Connect Permissions
+    private fun checkHealthConnectPermissions() {
+        try {
+            val client = HealthConnectClient.getOrCreate(this)
+            val permissions = setOf(HealthPermission.getReadPermission(OxygenSaturationRecord::class))
+
+            // Note: In a production app, you'd use the Health Connect permission contract here.
+            // For now, we ensure the client can be created.
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Health Connect not available or permissions missing", e)
         }
     }
 }
@@ -117,19 +119,23 @@ fun MainAppLogic() {
 fun WearApp() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val scope = rememberCoroutineScope()
+
+    // --- KEEP SCREEN ON ---
+    DisposableEffect(Unit) {
+        val activity = context as? Activity
+        activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        onDispose {
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
 
     // Services
     val measureClient = remember { HealthServices.getClient(context).measureClient }
     val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
-    val scope = rememberCoroutineScope()
-
     val healthConnectClient = remember {
-        try {
-            HealthConnectClient.getOrCreate(context)
-        } catch (e: Exception) {
-            Log.e("HealthConnect", "Service not available on this device", e)
-            null
-        }
+        try { HealthConnectClient.getOrCreate(context) }
+        catch (e: Exception) { null }
     }
 
     // --- STATE VARIABLES ---
@@ -138,26 +144,46 @@ fun WearApp() {
     var currentTime by remember { mutableStateOf(getCurrentTime()) }
     var supportsHeartRate by remember { mutableStateOf<Boolean?>(null) }
 
-    // Fall Detection State
+    // BP Estimation
+    var estimatedSys by remember { mutableStateOf(120) }
+    var estimatedDia by remember { mutableStateOf(80) }
+    var bpStatusColor by remember { mutableStateOf(Color.Green) }
+    var bpStatusText by remember { mutableStateOf("Normal") }
+
+    // Fall Detection
     var fallDetected by remember { mutableStateOf(false) }
     var fallMessage by remember { mutableStateOf("Scanning...") }
 
-    // --- 1. HEALTH CONNECT (SPO2 READ) ---
-    LaunchedEffect(Unit) {
-        try {
-            val capabilities = measureClient.getCapabilitiesAsync().await()
-            supportsHeartRate = capabilities.supportedDataTypesMeasure.contains(DataType.HEART_RATE_BPM)
-        } catch (e: Exception) {
-            supportsHeartRate = false
-        }
+    // --- FIREBASE SYNC LOGIC ---
+    val db = remember { Firebase.firestore }
 
-        if (healthConnectClient != null) {
-            spo2 = readLatestSpo2(healthConnectClient)
-        } else {
-            spo2 = "N/A"
+    LaunchedEffect(heartRate, spo2, fallDetected, estimatedSys, estimatedDia) {
+        val currentTimeMillis = System.currentTimeMillis()
+
+        val healthData = hashMapOf(
+            "heartRate" to heartRate,
+            "spo2" to spo2,
+            "bloodPressure" to "$estimatedSys/$estimatedDia",
+            "bpStatus" to bpStatusText,
+            "fallDetected" to fallDetected,
+            "statusMessage" to fallMessage,
+            "timestamp" to currentTimeMillis
+        )
+
+        val patientRef = db.collection("patients").document("patient_001")
+
+        patientRef.set(healthData)
+            .addOnFailureListener { Log.w("Firebase", "Error updating status") }
+
+        if (heartRate != "..." && heartRate != "N/A") {
+            patientRef.collection("history").document(currentTimeMillis.toString())
+                .set(healthData)
+                .addOnSuccessListener { Log.d("Firebase", "Historical data point saved!") }
+                .addOnFailureListener { e -> Log.w("Firebase", "Error saving history", e) }
         }
     }
 
+    // --- 1. HEALTH CONNECT SPO2 RETRIEVAL (Triggered on App Resume) ---
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
@@ -165,35 +191,29 @@ fun WearApp() {
                     scope.launch {
                         spo2 = readLatestSpo2(healthConnectClient)
                     }
+                } else {
+                    spo2 = "No API"
                 }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-        }
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // --- 2. FALL DETECTION LOGIC (NEW) ---
+    // --- 2. FALL DETECTION LOGIC ---
     DisposableEffect(Unit) {
         val listener = object : SensorEventListener {
             override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
-
             override fun onSensorChanged(event: SensorEvent?) {
                 if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER) {
                     val x = event.values[0]
                     val y = event.values[1]
                     val z = event.values[2]
 
-                    // Calculate Vector Magnitude (G-Force)
                     val gForce = sqrt(x * x + y * y + z * z) / 9.81
-
-                    // THRESHOLD: If G-Force > 2.5, trigger fall
                     if (gForce > 2.5) {
                         fallDetected = true
                         fallMessage = "DETECTED!"
-
-                        // Reset after 5 seconds
                         scope.launch {
                             delay(5000)
                             fallDetected = false
@@ -203,14 +223,9 @@ fun WearApp() {
                 }
             }
         }
-
-        // Register Accelerometer
         val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         sensorManager.registerListener(listener, accelerometer, SensorManager.SENSOR_DELAY_NORMAL)
-
-        onDispose {
-            sensorManager.unregisterListener(listener)
-        }
+        onDispose { sensorManager.unregisterListener(listener) }
     }
 
     // --- 3. CLOCK LOOP ---
@@ -221,7 +236,16 @@ fun WearApp() {
         }
     }
 
-    // --- 4. HEART RATE LOGIC ---
+    // --- 4. HEART RATE & BP ESTIMATION LOGIC ---
+    LaunchedEffect(Unit) {
+        try {
+            val capabilities = measureClient.getCapabilitiesAsync().await()
+            supportsHeartRate = capabilities.supportedDataTypesMeasure.contains(DataType.HEART_RATE_BPM)
+        } catch (e: Exception) {
+            supportsHeartRate = false
+        }
+    }
+
     LaunchedEffect(supportsHeartRate) {
         if (supportsHeartRate == false) {
             heartRate = "N/A"
@@ -241,7 +265,32 @@ fun WearApp() {
                     awaitClose { measureClient.unregisterMeasureCallbackAsync(DataType.HEART_RATE_BPM, callback) }
                 }.first()
             }
-            heartRate = hrValue?.toInt()?.toString() ?: "--"
+
+            val hrInt = hrValue?.toInt()
+            heartRate = hrInt?.toString() ?: "--"
+
+            if (hrInt != null) {
+                val diff = hrInt - 70
+                val estimatedS = 115 + (diff * 0.5).toInt()
+                val estimatedD = 75 + (diff * 0.2).toInt()
+
+                estimatedSys = estimatedS
+                estimatedDia = estimatedD
+
+                if (estimatedS < 120 && estimatedD < 80) {
+                    bpStatusText = "Normal"
+                    bpStatusColor = Color.Green
+                } else if (estimatedS < 130 && estimatedD < 80) {
+                    bpStatusText = "Elevated"
+                    bpStatusColor = Color.Yellow
+                } else if (estimatedS < 140 || estimatedD < 90) {
+                    bpStatusText = "High (Stage 1)"
+                    bpStatusColor = Color(0xFFFFA500)
+                } else {
+                    bpStatusText = "High (Stage 2)"
+                    bpStatusColor = Color.Red
+                }
+            }
             delay(60 * 1000L)
         }
     }
@@ -261,16 +310,14 @@ fun WearApp() {
                     HeartbeatContent(heartRate = heartRate, currentTime = currentTime)
                 }
                 HealthCard(modifier = Modifier.weight(0.3f)) {
-                    BloodPressureContent()
+                    BloodPressureContent(estimatedSys, estimatedDia, bpStatusText, bpStatusColor)
                 }
             }
             Spacer(modifier = Modifier.height(2.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                 HealthCard(modifier = Modifier.weight(0.3f)) {
-                    Spo2Content(spo2 = spo2)
+                    IntentSpo2Content(spo2 = spo2)
                 }
-
-                // UPDATED FALL DETECTION CARD
                 HealthCard(
                     modifier = Modifier.weight(0.3f),
                     backgroundColor = if (fallDetected) Color.Red else MaterialTheme.colors.surface
@@ -285,18 +332,13 @@ fun WearApp() {
 // --- HELPER FUNCTIONS ---
 
 fun launchSamsungHealthSpo2(context: Context) {
-    val packages = listOf(
-        "com.sec.android.app.shealth",
-        "com.samsung.android.wear.shealth"
-    )
+    val packages = listOf("com.sec.android.app.shealth", "com.samsung.android.wear.shealth")
     val deepLink = "shealth://oxygen_saturation"
-    var appFound = false
 
     for (packageName in packages) {
         try {
             val launchIntent = context.packageManager.getLaunchIntentForPackage(packageName)
             if (launchIntent != null) {
-                appFound = true
                 try {
                     val intent = Intent(Intent.ACTION_VIEW, Uri.parse(deepLink))
                     intent.setPackage(packageName)
@@ -310,10 +352,7 @@ fun launchSamsungHealthSpo2(context: Context) {
             }
         } catch (e: Exception) { }
     }
-
-    if (!appFound) {
-        Toast.makeText(context, "Samsung Health app not installed", Toast.LENGTH_SHORT).show()
-    }
+    Toast.makeText(context, "Samsung Health app not installed", Toast.LENGTH_SHORT).show()
 }
 
 suspend fun readLatestSpo2(client: HealthConnectClient): String {
@@ -325,7 +364,7 @@ suspend fun readLatestSpo2(client: HealthConnectClient): String {
                     startTime = Instant.now().minus(24, ChronoUnit.HOURS),
                     endTime = Instant.now()
                 ),
-                ascendingOrder = false,
+                ascendingOrder = false, // Gets the newest record first
                 pageSize = 1
             )
         )
@@ -353,35 +392,30 @@ fun HealthCard(
     Card(
         onClick = {},
         modifier = modifier.clip(RoundedCornerShape(12.dp)),
-        // We use backgroundPainter to handle color changes dynamically
         backgroundPainter = CardDefaults.cardBackgroundPainter(
             startBackgroundColor = backgroundColor,
             endBackgroundColor = backgroundColor
         )
     ) {
-        Box(modifier = Modifier.padding(2.dp)) {
-            content()
-        }
+        Box(modifier = Modifier.padding(2.dp)) { content() }
     }
 }
 
 @Composable
-fun Spo2Content(spo2: String) {
+fun IntentSpo2Content(spo2: String) {
     val context = LocalContext.current
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-        Icon(Icons.Default.Favorite, "SPO2", tint = MaterialTheme.colors.primary, modifier = Modifier.size(12.dp))
+        Icon(Icons.Default.Favorite, "SPO2", tint = Color.Cyan, modifier = Modifier.size(12.dp))
         Text("SPO2 Level", fontWeight = FontWeight.Bold, fontSize = 8.sp)
         Spacer(modifier = Modifier.height(1.dp))
         Text(spo2, fontSize = 12.sp, fontWeight = FontWeight.Bold)
         Spacer(modifier = Modifier.height(4.dp))
         Button(
-            onClick = {
-                launchSamsungHealthSpo2(context)
-            },
+            onClick = { launchSamsungHealthSpo2(context) },
             modifier = Modifier.height(20.dp),
             colors = ButtonDefaults.buttonColors(backgroundColor = MaterialTheme.colors.surface)
         ) {
-            Text("MEASURE", fontSize = 6.sp, fontWeight = FontWeight.Bold)
+            Text("OPEN APP", fontSize = 6.sp, fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -398,12 +432,13 @@ fun HeartbeatContent(heartRate: String, currentTime: String) {
 }
 
 @Composable
-fun BloodPressureContent() {
+fun BloodPressureContent(systolic: Int, diastolic: Int, status: String, color: Color) {
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
         Icon(Icons.Default.FlashOn, "BP", tint = MaterialTheme.colors.primary, modifier = Modifier.size(12.dp))
-        Text("Blood Pressure", fontWeight = FontWeight.Bold, fontSize = 8.sp)
+        Text("BP (Est.)", fontWeight = FontWeight.Bold, fontSize = 8.sp)
         Spacer(modifier = Modifier.height(1.dp))
-        Text("120/80", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        Text("$systolic/$diastolic", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+        Text(status, fontSize = 8.sp, fontWeight = FontWeight.Bold, color = color)
     }
 }
 
@@ -416,18 +451,8 @@ fun FallDetectionContent(isFallDetected: Boolean, statusMessage: String) {
             tint = if (isFallDetected) Color.White else MaterialTheme.colors.primary,
             modifier = Modifier.size(12.dp)
         )
-        Text(
-            "Fall Status",
-            fontWeight = FontWeight.Bold,
-            fontSize = 8.sp,
-            color = if (isFallDetected) Color.White else MaterialTheme.colors.onSurface
-        )
+        Text("Fall Status", fontWeight = FontWeight.Bold, fontSize = 8.sp, color = if (isFallDetected) Color.White else MaterialTheme.colors.onSurface)
         Spacer(modifier = Modifier.height(1.dp))
-        Text(
-            statusMessage,
-            fontSize = 10.sp,
-            fontWeight = FontWeight.Bold,
-            color = if (isFallDetected) Color.White else MaterialTheme.colors.onSurface
-        )
+        Text(statusMessage, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = if (isFallDetected) Color.White else MaterialTheme.colors.onSurface)
     }
 }
