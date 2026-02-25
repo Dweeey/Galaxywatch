@@ -54,9 +54,8 @@ import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.guava.await // Required for MeasureClient capabilities
+import kotlinx.coroutines.guava.await
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withTimeoutOrNull
 import java.text.SimpleDateFormat
 import java.time.Instant
@@ -99,9 +98,7 @@ class MainActivity : ComponentActivity() {
         try {
             val client = HealthConnectClient.getOrCreate(this)
             val permissions = setOf(HealthPermission.getReadPermission(OxygenSaturationRecord::class))
-
-            // Note: In a production app, you'd use the Health Connect permission contract here.
-            // For now, we ensure the client can be created.
+            // In a production app, use the Health Connect permission contract here.
         } catch (e: Exception) {
             Log.e("MainActivity", "Health Connect not available or permissions missing", e)
         }
@@ -157,6 +154,7 @@ fun WearApp() {
     // --- FIREBASE SYNC LOGIC ---
     val db = remember { Firebase.firestore }
 
+    // Trigger on any state change to log everything in real-time
     LaunchedEffect(heartRate, spo2, fallDetected, estimatedSys, estimatedDia) {
         val currentTimeMillis = System.currentTimeMillis()
 
@@ -172,15 +170,15 @@ fun WearApp() {
 
         val patientRef = db.collection("patients").document("patient_001")
 
+        // 1. UPDATE CURRENT STATUS (Home Screen)
         patientRef.set(healthData)
             .addOnFailureListener { Log.w("Firebase", "Error updating status") }
 
-        if (heartRate != "..." && heartRate != "N/A") {
-            patientRef.collection("history").document(currentTimeMillis.toString())
-                .set(healthData)
-                .addOnSuccessListener { Log.d("Firebase", "Historical data point saved!") }
-                .addOnFailureListener { e -> Log.w("Firebase", "Error saving history", e) }
-        }
+        // 2. SAVE TO HISTORY LOG (Unconditional save)
+        patientRef.collection("history").document(currentTimeMillis.toString())
+            .set(healthData)
+            .addOnSuccessListener { Log.d("Firebase", "Historical data point saved!") }
+            .addOnFailureListener { e -> Log.w("Firebase", "Error saving history", e) }
     }
 
     // --- 1. HEALTH CONNECT SPO2 RETRIEVAL (Triggered on App Resume) ---
@@ -211,6 +209,8 @@ fun WearApp() {
                     val z = event.values[2]
 
                     val gForce = sqrt(x * x + y * y + z * z) / 9.81
+
+                    // THRESHOLD CHECK
                     if (gForce > 2.5) {
                         fallDetected = true
                         fallMessage = "DETECTED!"
@@ -364,7 +364,7 @@ suspend fun readLatestSpo2(client: HealthConnectClient): String {
                     startTime = Instant.now().minus(24, ChronoUnit.HOURS),
                     endTime = Instant.now()
                 ),
-                ascendingOrder = false, // Gets the newest record first
+                ascendingOrder = false,
                 pageSize = 1
             )
         )
