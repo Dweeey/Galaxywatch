@@ -12,6 +12,7 @@ import android.hardware.SensorManager
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
+import android.view.ContextThemeWrapper
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -34,6 +35,7 @@ import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.permission.HealthPermission
@@ -50,6 +52,16 @@ import androidx.wear.compose.material.*
 import com.example.galaxywatch.presentation.theme.GalaxyWatchTheme
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
+
+// --- ZEGOCLOUD IMPORTS ---
+import com.zegocloud.uikit.prebuilt.call.ZegoUIKitPrebuiltCallConfig
+import com.zegocloud.uikit.prebuilt.call.config.ZegoMenuBarButtonName
+import com.zegocloud.uikit.prebuilt.call.invite.ZegoUIKitPrebuiltCallInvitationConfig
+import com.zegocloud.uikit.prebuilt.call.invite.ZegoUIKitPrebuiltCallInvitationService
+import com.zegocloud.uikit.prebuilt.call.invite.internal.ZegoUIKitPrebuiltCallConfigProvider
+import com.zegocloud.uikit.prebuilt.call.invite.widget.ZegoSendCallInvitationButton
+import com.zegocloud.uikit.service.defines.ZegoUIKitUser
+
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.callbackFlow
@@ -61,29 +73,44 @@ import java.text.SimpleDateFormat
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.*
+import java.util.Arrays
 import kotlin.math.sqrt
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1. Basic Sensor Permissions Launcher
+        // 1. MULTIPLE PERMISSIONS LAUNCHER (Sensors + Microphone)
         val permissionLauncher = registerForActivityResult(
-            ActivityResultContracts.RequestPermission()
-        ) { isGranted ->
-            if (isGranted) checkHealthConnectPermissions()
-            else Toast.makeText(this, "Body Sensor permission denied", Toast.LENGTH_SHORT).show()
+            ActivityResultContracts.RequestMultiplePermissions()
+        ) { permissions ->
+            val sensorsGranted = permissions[Manifest.permission.BODY_SENSORS] ?: false
+            val micGranted = permissions[Manifest.permission.RECORD_AUDIO] ?: false
+
+            if (sensorsGranted) checkHealthConnectPermissions()
+            if (!micGranted) {
+                Toast.makeText(this, "Mic is required for SOS Calls!", Toast.LENGTH_LONG).show()
+            }
         }
 
-        setContent {
-            val isBodySensorGranted = ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.BODY_SENSORS
-            ) == PackageManager.PERMISSION_GRANTED
+        // --- ZEGOCLOUD INITIALIZATION ---
+        initZegoCloud()
 
-            if (!isBodySensorGranted) {
+        setContent {
+            // 2. CHECK WHICH PERMISSIONS ARE MISSING ON BOOT
+            val missingPermissions = mutableListOf<String>()
+
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BODY_SENSORS) != PackageManager.PERMISSION_GRANTED) {
+                missingPermissions.add(Manifest.permission.BODY_SENSORS)
+            }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                missingPermissions.add(Manifest.permission.RECORD_AUDIO)
+            }
+
+            // 3. LAUNCH PERMISSION REQUEST IF NEEDED
+            if (missingPermissions.isNotEmpty()) {
                 LaunchedEffect(Unit) {
-                    permissionLauncher.launch(Manifest.permission.BODY_SENSORS)
+                    permissionLauncher.launch(missingPermissions.toTypedArray())
                 }
             } else {
                 LaunchedEffect(Unit) { checkHealthConnectPermissions() }
@@ -93,12 +120,51 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // 2. Health Connect Permissions
+    private fun initZegoCloud() {
+        val sharedPrefs = getSharedPreferences("ElderCarePrefs", Context.MODE_PRIVATE)
+        val patientId = sharedPrefs.getString("PATIENT_ID", "patient_001") ?: "patient_001"
+
+        val appID: Long = 1279737711L
+        val appSign = "50a1c85a028c5224b00ec060afda1e71159d4cfdc124e124c441a981d83cd289"
+
+        val callInvitationConfig = com.zegocloud.uikit.prebuilt.call.invite.ZegoUIKitPrebuiltCallInvitationConfig()
+
+        callInvitationConfig.provider = com.zegocloud.uikit.prebuilt.call.invite.internal.ZegoUIKitPrebuiltCallConfigProvider { invitationData ->
+            val config = com.zegocloud.uikit.prebuilt.call.ZegoUIKitPrebuiltCallConfig.oneOnOneVoiceCall()
+
+            // --- CLEAN WATCH UI SETTINGS ---
+            config.useSpeakerWhenJoining = true
+            config.turnOnMicrophoneWhenJoining = true
+
+            // Disable everything that causes "Overflow" or "Floating Window" crashes
+            config.topMenuBarConfig.isVisible = false
+            config.bottomMenuBarConfig.hideByClick = false
+            config.bottomMenuBarConfig.maxCount = 2
+
+            // Only show the two buttons that actually fit on a watch face
+            config.bottomMenuBarConfig.buttons = java.util.Arrays.asList(
+                com.zegocloud.uikit.prebuilt.call.config.ZegoMenuBarButtonName.HANG_UP_BUTTON,
+                com.zegocloud.uikit.prebuilt.call.config.ZegoMenuBarButtonName.TOGGLE_MICROPHONE_BUTTON
+            )
+
+            config
+        }
+
+        com.zegocloud.uikit.prebuilt.call.invite.ZegoUIKitPrebuiltCallInvitationService.init(
+            application, appID, appSign, patientId, "Patient ($patientId)", callInvitationConfig
+        )
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        ZegoUIKitPrebuiltCallInvitationService.unInit()
+    }
+
+    // Health Connect Permissions
     private fun checkHealthConnectPermissions() {
         try {
             val client = HealthConnectClient.getOrCreate(this)
             val permissions = setOf(HealthPermission.getReadPermission(OxygenSaturationRecord::class))
-            // In a production app, use the Health Connect permission contract here.
         } catch (e: Exception) {
             Log.e("MainActivity", "Health Connect not available or permissions missing", e)
         }
@@ -127,7 +193,6 @@ fun WearApp() {
         }
     }
 
-    // Services
     val measureClient = remember { HealthServices.getClient(context).measureClient }
     val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     val healthConnectClient = remember {
@@ -135,26 +200,21 @@ fun WearApp() {
         catch (e: Exception) { null }
     }
 
-    // --- STATE VARIABLES ---
     var heartRate by remember { mutableStateOf("...") }
     var spo2 by remember { mutableStateOf("--") }
     var currentTime by remember { mutableStateOf(getCurrentTime()) }
     var supportsHeartRate by remember { mutableStateOf<Boolean?>(null) }
 
-    // BP Estimation
     var estimatedSys by remember { mutableStateOf(120) }
     var estimatedDia by remember { mutableStateOf(80) }
     var bpStatusColor by remember { mutableStateOf(Color.Green) }
     var bpStatusText by remember { mutableStateOf("Normal") }
 
-    // Fall Detection
     var fallDetected by remember { mutableStateOf(false) }
     var fallMessage by remember { mutableStateOf("Scanning...") }
 
-    // --- FIREBASE SYNC LOGIC ---
     val db = remember { Firebase.firestore }
 
-    // Trigger on any state change to log everything in real-time
     LaunchedEffect(heartRate, spo2, fallDetected, estimatedSys, estimatedDia) {
         val currentTimeMillis = System.currentTimeMillis()
 
@@ -170,25 +230,20 @@ fun WearApp() {
 
         val patientRef = db.collection("patients").document("patient_001")
 
-        // 1. UPDATE CURRENT STATUS (Home Screen)
         patientRef.set(healthData)
             .addOnFailureListener { Log.w("Firebase", "Error updating status") }
 
-        // 2. SAVE TO HISTORY LOG (Unconditional save)
         patientRef.collection("history").document(currentTimeMillis.toString())
             .set(healthData)
             .addOnSuccessListener { Log.d("Firebase", "Historical data point saved!") }
             .addOnFailureListener { e -> Log.w("Firebase", "Error saving history", e) }
     }
 
-    // --- 1. HEALTH CONNECT SPO2 RETRIEVAL (Triggered on App Resume) ---
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 if (healthConnectClient != null) {
-                    scope.launch {
-                        spo2 = readLatestSpo2(healthConnectClient)
-                    }
+                    scope.launch { spo2 = readLatestSpo2(healthConnectClient) }
                 } else {
                     spo2 = "No API"
                 }
@@ -198,7 +253,6 @@ fun WearApp() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // --- 2. FALL DETECTION LOGIC ---
     DisposableEffect(Unit) {
         val listener = object : SensorEventListener {
             override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
@@ -210,7 +264,6 @@ fun WearApp() {
 
                     val gForce = sqrt(x * x + y * y + z * z) / 9.81
 
-                    // THRESHOLD CHECK
                     if (gForce > 2.5) {
                         fallDetected = true
                         fallMessage = "DETECTED!"
@@ -228,7 +281,6 @@ fun WearApp() {
         onDispose { sensorManager.unregisterListener(listener) }
     }
 
-    // --- 3. CLOCK LOOP ---
     LaunchedEffect(Unit) {
         while (true) {
             currentTime = getCurrentTime()
@@ -236,7 +288,6 @@ fun WearApp() {
         }
     }
 
-    // --- 4. HEART RATE & BP ESTIMATION LOGIC ---
     LaunchedEffect(Unit) {
         try {
             val capabilities = measureClient.getCapabilitiesAsync().await()
@@ -295,7 +346,6 @@ fun WearApp() {
         }
     }
 
-    // --- UI LAYOUT ---
     Scaffold(
         timeText = { TimeText() },
         modifier = Modifier.fillMaxSize()
@@ -325,6 +375,23 @@ fun WearApp() {
                     FallDetectionContent(isFallDetected = fallDetected, statusMessage = fallMessage)
                 }
             }
+
+            // --- ZEGOCLOUD SOS CALL BUTTON (WITH MAGIC WRAPPER) ---
+            Spacer(modifier = Modifier.height(4.dp))
+            AndroidView(
+                modifier = Modifier.size(36.dp),
+                factory = { ctx ->
+                    // Give the button a fake "Phone" theme so it doesn't crash on Wear OS
+                    val themedContext = ContextThemeWrapper(ctx, android.R.style.Theme_DeviceDefault_NoActionBar)
+
+                    ZegoSendCallInvitationButton(themedContext).apply {
+                        setIsVideoCall(false)
+
+                        // THIS EXACTLY MATCHES YOUR FLUTTER APP CAREGIVER ID
+                        setInvitees(listOf(ZegoUIKitUser("5yeapeXNTZcofATleG5ZHZ8siZt2", "Caregiver")))
+                    } as android.view.View
+                }
+            )
         }
     }
 }

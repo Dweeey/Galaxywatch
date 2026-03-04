@@ -1,10 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.BODY_SENSORS" />
     <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
     <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <uses-permission android:name="android.permission.health.READ_OXYGEN_SATURATION"/>
 
@@ -20,7 +35,7 @@
         android:icon="@drawable/logo"
         android:label="ElderCare+"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.DeviceDefault">
+        android:theme="@style/Theme.MaterialComponents.Light.NoActionBar" >
 
         <uses-library
             android:name="com.google.android.wearable"
@@ -47,18 +62,15 @@
             android:theme="@style/MainActivityTheme.Starting">
         </activity>
 
-        <activity
-            android:name=".presentation.SignupActivity"
-            android:exported="false"
-            android:theme="@style/MainActivityTheme.Starting" />
+
 
         <activity
             android:name="com.example.galaxywatch.presentation.PermissionsActivity"
             android:exported="true"
-            android:taskAffinity="">
-            <intent-filter>
-                <action android:name="androidx.health.ACTION_SHOW_PERMISSIONS_RATIONALE" />
-            </intent-filter>
+            android:taskAffinity=""
+            android:theme="@style/MainActivityTheme.Starting"> <intent-filter>
+            <action android:name="androidx.health.ACTION_SHOW_PERMISSIONS_RATIONALE" />
+        </intent-filter>
         </activity>
 
         <activity-alias
@@ -71,6 +83,12 @@
                 <category android:name="android.intent.category.HEALTH_PERMISSIONS" />
             </intent-filter>
         </activity-alias>
+
+        <service
+            android:name="com.zegocloud.uikit.prebuilt.call.internal.ZegoService"
+            android:foregroundServiceType="microphone"
+            android:exported="false"
+            tools:node="replace" />
 
     </application>
 

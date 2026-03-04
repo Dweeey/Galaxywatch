@@ -78,4 +78,10 @@ dependencies {
 
 //    QR
     implementation("com.google.zxing:core:3.5.3")
+
+//    VOIP
+    implementation("com.github.ZEGOCLOUD:zego_uikit_prebuilt_call_android:+")
+
+    implementation("androidx.appcompat:appcompat:1.6.1")
+    implementation("com.google.android.material:material:1.11.0")
 }
