@@ -218,7 +218,21 @@ fun WearApp() {
     LaunchedEffect(heartRate, spo2, fallDetected, estimatedSys, estimatedDia) {
         val currentTimeMillis = System.currentTimeMillis()
 
-        val healthData = hashMapOf(
+        // 1. DATA FOR THE LIVE DASHBOARD
+        // Notice: We completely REMOVED "spo2" from this map.
+        // This prevents the watch from overwriting or "erasing" the value from the phone app.
+        val liveUpdates = hashMapOf<String, Any>(
+            "heartRate" to heartRate,
+            "bloodPressure" to "$estimatedSys/$estimatedDia",
+            "bpStatus" to bpStatusText,
+            "fallDetected" to fallDetected,
+            "statusMessage" to fallMessage,
+            "timestamp" to currentTimeMillis
+        )
+
+        // 2. DATA FOR THE HISTORY LOGS
+        // We still keep spo2 here so your history records/graphs are complete!
+        val historyData = hashMapOf(
             "heartRate" to heartRate,
             "spo2" to spo2,
             "bloodPressure" to "$estimatedSys/$estimatedDia",
@@ -230,15 +244,20 @@ fun WearApp() {
 
         val patientRef = db.collection("patients").document("patient_001")
 
-        patientRef.set(healthData)
-            .addOnFailureListener { Log.w("Firebase", "Error updating status") }
+        // CRITICAL CHANGE: Use .update() instead of .set()
+        // .update() only changes the keys provided in the map and ignores "spo2"
+        patientRef.update(liveUpdates)
+            .addOnFailureListener {
+                // If the document doesn't exist yet, we use set with merge
+                patientRef.set(liveUpdates, com.google.firebase.firestore.SetOptions.merge())
+            }
 
+        // Save the full snapshot to history
         patientRef.collection("history").document(currentTimeMillis.toString())
-            .set(healthData)
+            .set(historyData)
             .addOnSuccessListener { Log.d("Firebase", "Historical data point saved!") }
             .addOnFailureListener { e -> Log.w("Firebase", "Error saving history", e) }
     }
-
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
