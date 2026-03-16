@@ -5,10 +5,6 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
@@ -43,15 +39,12 @@ import androidx.health.connect.client.records.OxygenSaturationRecord
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.response.ReadRecordsResponse
 import androidx.health.connect.client.time.TimeRangeFilter
-import androidx.health.services.client.HealthServices
-import androidx.health.services.client.MeasureCallback
-import androidx.health.services.client.data.*
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.wear.compose.material.*
+import com.example.galaxywatch.BackgroundVitalsService
+import com.example.galaxywatch.SharedVitals // --- NEW: Import the shared memory object! ---
 import com.example.galaxywatch.presentation.theme.GalaxyWatchTheme
-import com.google.firebase.firestore.ktx.firestore
-import com.google.firebase.ktx.Firebase
 
 // --- ZEGOCLOUD IMPORTS ---
 import com.zegocloud.uikit.prebuilt.call.ZegoUIKitPrebuiltCallConfig
@@ -62,32 +55,30 @@ import com.zegocloud.uikit.prebuilt.call.invite.internal.ZegoUIKitPrebuiltCallCo
 import com.zegocloud.uikit.prebuilt.call.invite.widget.ZegoSendCallInvitationButton
 import com.zegocloud.uikit.service.defines.ZegoUIKitUser
 
-import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.guava.await
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 import java.text.SimpleDateFormat
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.*
-import java.util.Arrays
-import kotlin.math.sqrt
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1. MULTIPLE PERMISSIONS LAUNCHER (Sensors + Microphone)
+        // 1. MULTIPLE PERMISSIONS LAUNCHER
         val permissionLauncher = registerForActivityResult(
             ActivityResultContracts.RequestMultiplePermissions()
         ) { permissions ->
             val sensorsGranted = permissions[Manifest.permission.BODY_SENSORS] ?: false
             val micGranted = permissions[Manifest.permission.RECORD_AUDIO] ?: false
 
-            if (sensorsGranted) checkHealthConnectPermissions()
+            if (sensorsGranted) {
+                checkHealthConnectPermissions()
+                // START BACKGROUND SERVICE ONCE PERMISSIONS GRANTED
+                val serviceIntent = Intent(this, BackgroundVitalsService::class.java)
+                startForegroundService(serviceIntent)
+            }
             if (!micGranted) {
                 Toast.makeText(this, "Mic is required for SOS Calls!", Toast.LENGTH_LONG).show()
             }
@@ -107,13 +98,18 @@ class MainActivity : ComponentActivity() {
                 missingPermissions.add(Manifest.permission.RECORD_AUDIO)
             }
 
-            // 3. LAUNCH PERMISSION REQUEST IF NEEDED
+            // 3. LAUNCH PERMISSION REQUEST IF NEEDED, OTHERWISE START SERVICE
             if (missingPermissions.isNotEmpty()) {
                 LaunchedEffect(Unit) {
                     permissionLauncher.launch(missingPermissions.toTypedArray())
                 }
             } else {
-                LaunchedEffect(Unit) { checkHealthConnectPermissions() }
+                LaunchedEffect(Unit) {
+                    checkHealthConnectPermissions()
+                    // START BACKGROUND SERVICE ON BOOT
+                    val serviceIntent = Intent(this@MainActivity, BackgroundVitalsService::class.java)
+                    startForegroundService(serviceIntent)
+                }
             }
 
             MainAppLogic()
@@ -160,7 +156,6 @@ class MainActivity : ComponentActivity() {
         ZegoUIKitPrebuiltCallInvitationService.unInit()
     }
 
-    // Health Connect Permissions
     private fun checkHealthConnectPermissions() {
         try {
             val client = HealthConnectClient.getOrCreate(this)
@@ -193,78 +188,38 @@ fun WearApp() {
         }
     }
 
-    val measureClient = remember { HealthServices.getClient(context).measureClient }
-    val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     val healthConnectClient = remember {
         try { HealthConnectClient.getOrCreate(context) }
         catch (e: Exception) { null }
     }
 
-    var heartRate by remember { mutableStateOf("...") }
+    // --- NEW: READ FROM SHARED MEMORY INSTEAD OF SENSORS ---
+    val heartRate by SharedVitals.heartRate.collectAsState()
+    val estimatedSys by SharedVitals.sys.collectAsState()
+    val estimatedDia by SharedVitals.dia.collectAsState()
+    val bpStatusText by SharedVitals.bpStatusText.collectAsState()
+    val fallDetected by SharedVitals.fallDetected.collectAsState()
+    val fallMessage by SharedVitals.fallMessage.collectAsState()
+
+    // Calculate color based on the text string
+    val bpStatusColor = when(bpStatusText) {
+        "Normal" -> Color.Green
+        "Elevated" -> Color.Yellow
+        "High (Stage 1)" -> Color(0xFFFFA500)
+        else -> Color.Red
+    }
+
     var spo2 by remember { mutableStateOf("--") }
     var currentTime by remember { mutableStateOf(getCurrentTime()) }
-    var supportsHeartRate by remember { mutableStateOf<Boolean?>(null) }
 
-    var estimatedSys by remember { mutableStateOf(120) }
-    var estimatedDia by remember { mutableStateOf(80) }
-    var bpStatusColor by remember { mutableStateOf(Color.Green) }
-    var bpStatusText by remember { mutableStateOf("Normal") }
-
-    var fallDetected by remember { mutableStateOf(false) }
-    var fallMessage by remember { mutableStateOf("Scanning...") }
-
-    val db = remember { Firebase.firestore }
-
-    LaunchedEffect(heartRate, spo2, fallDetected, estimatedSys, estimatedDia) {
-        val currentTimeMillis = System.currentTimeMillis()
-
-        // 1. DATA FOR THE LIVE DASHBOARD
-        // Notice: We completely REMOVED "spo2" from this map.
-        // This prevents the watch from overwriting or "erasing" the value from the phone app.
-        val liveUpdates = hashMapOf<String, Any>(
-            "heartRate" to heartRate,
-            "bloodPressure" to "$estimatedSys/$estimatedDia",
-            "bpStatus" to bpStatusText,
-            "fallDetected" to fallDetected,
-            "statusMessage" to fallMessage,
-            "timestamp" to currentTimeMillis
-        )
-
-        // 2. DATA FOR THE HISTORY LOGS
-        // We still keep spo2 here so your history records/graphs are complete!
-        val historyData = hashMapOf(
-            "heartRate" to heartRate,
-            "spo2" to spo2,
-            "bloodPressure" to "$estimatedSys/$estimatedDia",
-            "bpStatus" to bpStatusText,
-            "fallDetected" to fallDetected,
-            "statusMessage" to fallMessage,
-            "timestamp" to currentTimeMillis
-        )
-
-        val patientRef = db.collection("patients").document("patient_001")
-
-        // CRITICAL CHANGE: Use .update() instead of .set()
-        // .update() only changes the keys provided in the map and ignores "spo2"
-        patientRef.update(liveUpdates)
-            .addOnFailureListener {
-                // If the document doesn't exist yet, we use set with merge
-                patientRef.set(liveUpdates, com.google.firebase.firestore.SetOptions.merge())
-            }
-
-        // Save the full snapshot to history
-        patientRef.collection("history").document(currentTimeMillis.toString())
-            .set(historyData)
-            .addOnSuccessListener { Log.d("Firebase", "Historical data point saved!") }
-            .addOnFailureListener { e -> Log.w("Firebase", "Error saving history", e) }
-    }
+    // Read SpO2 ONLY when the screen wakes up
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 if (healthConnectClient != null) {
                     scope.launch { spo2 = readLatestSpo2(healthConnectClient) }
                 } else {
-                    spo2 = "No API"
+                    spo2 = ""
                 }
             }
         }
@@ -272,96 +227,11 @@ fun WearApp() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    DisposableEffect(Unit) {
-        val listener = object : SensorEventListener {
-            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
-            override fun onSensorChanged(event: SensorEvent?) {
-                if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER) {
-                    val x = event.values[0]
-                    val y = event.values[1]
-                    val z = event.values[2]
-
-                    val gForce = sqrt(x * x + y * y + z * z) / 9.81
-
-                    if (gForce > 2.5) {
-                        fallDetected = true
-                        fallMessage = "DETECTED!"
-                        scope.launch {
-                            delay(5000)
-                            fallDetected = false
-                            fallMessage = "Scanning..."
-                        }
-                    }
-                }
-            }
-        }
-        val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-        sensorManager.registerListener(listener, accelerometer, SensorManager.SENSOR_DELAY_NORMAL)
-        onDispose { sensorManager.unregisterListener(listener) }
-    }
-
+    // Update the clock every second
     LaunchedEffect(Unit) {
         while (true) {
             currentTime = getCurrentTime()
             delay(1000)
-        }
-    }
-
-    LaunchedEffect(Unit) {
-        try {
-            val capabilities = measureClient.getCapabilitiesAsync().await()
-            supportsHeartRate = capabilities.supportedDataTypesMeasure.contains(DataType.HEART_RATE_BPM)
-        } catch (e: Exception) {
-            supportsHeartRate = false
-        }
-    }
-
-    LaunchedEffect(supportsHeartRate) {
-        if (supportsHeartRate == false) {
-            heartRate = "N/A"
-            return@LaunchedEffect
-        }
-        while (true) {
-            val hrValue: Double? = withTimeoutOrNull(30000L) {
-                callbackFlow {
-                    val callback = object : MeasureCallback {
-                        override fun onAvailabilityChanged(dataType: DeltaDataType<*, *>, availability: Availability) {}
-                        override fun onDataReceived(data: DataPointContainer) {
-                            val latest = data.getData(DataType.HEART_RATE_BPM).lastOrNull()?.value
-                            if (latest != null && latest > 0.0) trySend(latest)
-                        }
-                    }
-                    measureClient.registerMeasureCallback(DataType.HEART_RATE_BPM, callback)
-                    awaitClose { measureClient.unregisterMeasureCallbackAsync(DataType.HEART_RATE_BPM, callback) }
-                }.first()
-            }
-
-            val hrInt = hrValue?.toInt()
-            heartRate = hrInt?.toString() ?: "--"
-
-            if (hrInt != null) {
-                val diff = hrInt - 70
-                val estimatedS = 115 + (diff * 0.5).toInt()
-                val estimatedD = 75 + (diff * 0.2).toInt()
-
-                estimatedSys = estimatedS
-                estimatedDia = estimatedD
-
-                if (estimatedS < 120 && estimatedD < 80) {
-                    bpStatusText = "Normal"
-                    bpStatusColor = Color.Green
-                } else if (estimatedS < 130 && estimatedD < 80) {
-                    bpStatusText = "Elevated"
-                    bpStatusColor = Color.Yellow
-                } else if (estimatedS < 140 || estimatedD < 90) {
-                    bpStatusText = "High (Stage 1)"
-                    bpStatusColor = Color(0xFFFFA500)
-                } else {
-                    bpStatusText = "High (Stage 2)"
-                    bpStatusColor = Color.Red
-                }
-            }
-            delay(60 * 1000L)
         }
     }
 
@@ -395,18 +265,14 @@ fun WearApp() {
                 }
             }
 
-            // --- ZEGOCLOUD SOS CALL BUTTON (WITH MAGIC WRAPPER) ---
+            // --- ZEGOCLOUD SOS CALL BUTTON ---
             Spacer(modifier = Modifier.height(4.dp))
             AndroidView(
                 modifier = Modifier.size(36.dp),
                 factory = { ctx ->
-                    // Give the button a fake "Phone" theme so it doesn't crash on Wear OS
                     val themedContext = ContextThemeWrapper(ctx, android.R.style.Theme_DeviceDefault_NoActionBar)
-
                     ZegoSendCallInvitationButton(themedContext).apply {
                         setIsVideoCall(false)
-
-                        // THIS EXACTLY MATCHES YOUR FLUTTER APP CAREGIVER ID
                         setInvitees(listOf(ZegoUIKitUser("5yeapeXNTZcofATleG5ZHZ8siZt2", "Caregiver")))
                     } as android.view.View
                 }
