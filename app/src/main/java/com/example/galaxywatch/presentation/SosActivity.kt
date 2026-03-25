@@ -39,6 +39,17 @@ class SosActivity : ComponentActivity() {
         val appSign = "50a1c85a028c5224b00ec060afda1e71159d4cfdc124e124c441a981d83cd289"
 
         val callInvitationConfig = ZegoUIKitPrebuiltCallInvitationConfig()
+
+        // --- NEW: OFFLINE PUSH NOTIFICATION CONFIGURATION ---
+        val notificationConfig = com.zegocloud.uikit.prebuilt.call.config.ZegoNotificationConfig()
+        notificationConfig.sound = "zego_uikit_sound_call"
+        notificationConfig.channelID = "CallInvitation"
+        notificationConfig.channelName = "CallInvitation"
+
+        // Attach the push config to your main config
+        callInvitationConfig.notificationConfig = notificationConfig
+        // ----------------------------------------------------
+
         callInvitationConfig.provider = ZegoUIKitPrebuiltCallConfigProvider { _ ->
             val config = ZegoUIKitPrebuiltCallConfig.oneOnOneVoiceCall()
             config.useSpeakerWhenJoining = true

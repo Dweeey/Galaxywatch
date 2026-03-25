@@ -119,34 +119,30 @@ class MainActivity : ComponentActivity() {
     private fun initZegoCloud() {
         val sharedPrefs = getSharedPreferences("ElderCarePrefs", Context.MODE_PRIVATE)
         val patientId = sharedPrefs.getString("PATIENT_ID", "patient_001") ?: "patient_001"
-
         val appID: Long = 1279737711L
         val appSign = "50a1c85a028c5224b00ec060afda1e71159d4cfdc124e124c441a981d83cd289"
 
-        val callInvitationConfig = com.zegocloud.uikit.prebuilt.call.invite.ZegoUIKitPrebuiltCallInvitationConfig()
+        val callInvitationConfig = ZegoUIKitPrebuiltCallInvitationConfig()
 
-        callInvitationConfig.provider = com.zegocloud.uikit.prebuilt.call.invite.internal.ZegoUIKitPrebuiltCallConfigProvider { invitationData ->
-            val config = com.zegocloud.uikit.prebuilt.call.ZegoUIKitPrebuiltCallConfig.oneOnOneVoiceCall()
+        // --- NEW: OFFLINE PUSH NOTIFICATION CONFIGURATION ---
+        val notificationConfig = com.zegocloud.uikit.prebuilt.call.config.ZegoNotificationConfig()
+        notificationConfig.sound = "zego_uikit_sound_call"
+        notificationConfig.channelID = "CallInvitation"
+        notificationConfig.channelName = "CallInvitation"
 
-            // --- CLEAN WATCH UI SETTINGS ---
+        // Attach the push config to your main config
+        callInvitationConfig.notificationConfig = notificationConfig
+        // ----------------------------------------------------
+
+        callInvitationConfig.provider = ZegoUIKitPrebuiltCallConfigProvider { _ ->
+            val config = ZegoUIKitPrebuiltCallConfig.oneOnOneVoiceCall()
             config.useSpeakerWhenJoining = true
             config.turnOnMicrophoneWhenJoining = true
-
-            // Disable everything that causes "Overflow" or "Floating Window" crashes
             config.topMenuBarConfig.isVisible = false
-            config.bottomMenuBarConfig.hideByClick = false
-            config.bottomMenuBarConfig.maxCount = 2
-
-            // Only show the two buttons that actually fit on a watch face
-            config.bottomMenuBarConfig.buttons = java.util.Arrays.asList(
-                com.zegocloud.uikit.prebuilt.call.config.ZegoMenuBarButtonName.HANG_UP_BUTTON,
-                com.zegocloud.uikit.prebuilt.call.config.ZegoMenuBarButtonName.TOGGLE_MICROPHONE_BUTTON
-            )
-
             config
         }
 
-        com.zegocloud.uikit.prebuilt.call.invite.ZegoUIKitPrebuiltCallInvitationService.init(
+        ZegoUIKitPrebuiltCallInvitationService.init(
             application, appID, appSign, patientId, "Patient ($patientId)", callInvitationConfig
         )
     }

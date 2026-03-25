@@ -26,6 +26,11 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlin.math.sqrt
 
+// 🚨 NEW: TensorFlow Lite Imports
+import org.tensorflow.lite.Interpreter
+import java.io.FileInputStream
+import java.nio.channels.FileChannel
+
 class BackgroundVitalsService : Service(), SensorEventListener {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -35,6 +40,11 @@ class BackgroundVitalsService : Service(), SensorEventListener {
     // Hardware Sensors
     private var accelerometer: Sensor? = null
     private var offBodySensor: Sensor? = null // NEW: Off-wrist sensor
+
+    // 🚨 NEW: AI Variables
+    private var tflite: Interpreter? = null
+    private val sensorBuffer = FloatArray(512)
+    private var bufferIndex = 0
 
     // State Variables
     private var currentHeartRate = "--"
@@ -51,12 +61,16 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         super.onCreate()
         startForegroundServiceNotification()
 
+        // 🚨 NEW: Load the AI Brain
+        loadAIBrain()
+
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
 
         // 1. Start Fall Detection
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         accelerometer?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
+            // Using SENSOR_DELAY_GAME for faster AI data collection
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
 
         // 2. Start Off-Body Detection
@@ -70,6 +84,23 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
         // 4. Start the Firebase Sync Loop (Every 60 Seconds)
         startFirebaseSyncLoop()
+    }
+
+    // 🚨 NEW: Load the TFLite Model from the assets folder
+    private fun loadAIBrain() {
+        try {
+            val fileDescriptor = assets.openFd("sisfall_brain.tflite")
+            val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
+            val fileChannel = inputStream.channel
+            val startOffset = fileDescriptor.startOffset
+            val declaredLength = fileDescriptor.declaredLength
+            val tfliteModel = fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+
+            tflite = Interpreter(tfliteModel)
+            Log.d("FALL_AI", "Brain successfully loaded!")
+        } catch (e: Exception) {
+            Log.e("FALL_AI", "Error loading AI Brain: ${e.message}")
+        }
     }
 
     private fun startForegroundServiceNotification() {
@@ -137,24 +168,21 @@ class BackgroundVitalsService : Service(), SensorEventListener {
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
-        // --- 1. FALL DETECTION LOGIC ---
+        // --- 1. AI FALL DETECTION LOGIC ---
         if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER) {
-            val x = event.values[0]
-            val y = event.values[1]
-            val z = event.values[2]
-            val gForce = sqrt(x * x + y * y + z * z) / 9.81
 
-            // Only trigger a fall if the watch is actually being worn!
-            if (gForce > 2.5 && !fallDetected && isWatchOnWrist) {
-                fallDetected = true
-                fallMessage = "DETECTED!"
-                pushToFirebase() // Instantly alert Caregiver
+            // Only feed data to the AI if the watch is actually being worn
+            if (isWatchOnWrist) {
+                if (bufferIndex < 510) {
+                    sensorBuffer[bufferIndex++] = event.values[0] // X
+                    sensorBuffer[bufferIndex++] = event.values[1] // Y
+                    sensorBuffer[bufferIndex++] = event.values[2] // Z
+                }
 
-                serviceScope.launch {
-                    delay(5000) // Keep the fall status active for 5 seconds
-                    fallDetected = false
-                    fallMessage = "Scanning..."
-                    pushToFirebase() // Update Firebase that fall is cleared
+                // When the buffer hits 512, ask the AI to make a prediction
+                if (bufferIndex >= 512) {
+                    runFallDetectionInference()
+                    bufferIndex = 0 // Reset buffer for the next batch
                 }
             }
         }
@@ -171,6 +199,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                     // WATCH TAKEN OFF!
                     currentHeartRate = "--"
                     bpStatusText = "Watch Off Wrist"
+                    bufferIndex = 0 // 🚨 NEW: Clear half-finished AI data
                     pushToFirebase() // Instantly tell Caregiver
                 } else {
                     // WATCH PUT BACK ON!
@@ -178,6 +207,40 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                     pushToFirebase() // Instantly tell Caregiver
                 }
             }
+        }
+    }
+
+    // 🚨 NEW: AI Inference Function
+    private fun runFallDetectionInference() {
+        if (tflite == null) return
+
+        val input = arrayOf(sensorBuffer)
+        val output = arrayOf(FloatArray(3))
+
+        try {
+            tflite?.run(input, output)
+            val fallProbability = output[0][1] // Assuming Index 1 is the 'Fall' probability
+
+            // If the AI is >85% sure it's a fall, AND we aren't already alarming...
+            if (fallProbability > 0.85f && !fallDetected) {
+                val confidence = (fallProbability * 100).toInt()
+
+                fallDetected = true
+                fallMessage = "AI DETECTED! ($confidence%)"
+                pushToFirebase() // Instantly alert Caregiver
+
+                // Wait 5 seconds, then reset the alarm
+                serviceScope.launch {
+                    delay(5000)
+                    if (isWatchOnWrist) { // Only reset if they didn't take the watch off
+                        fallDetected = false
+                        fallMessage = "Scanning..."
+                        pushToFirebase()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("FALL_AI", "Inference crashed: ${e.message}")
         }
     }
 
@@ -234,6 +297,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         super.onDestroy()
         serviceScope.cancel()
         sensorManager.unregisterListener(this)
+        tflite?.close() // 🚨 NEW: Clean up the AI memory when service dies
     }
 }
 

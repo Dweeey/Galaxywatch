@@ -9,6 +9,10 @@ android {
     namespace = "com.example.galaxywatch"
     compileSdk = 35 // Use stable SDK 34 to avoid preview bugs
 
+    aaptOptions {
+        noCompress ("tflite")
+    }
+
     defaultConfig {
         applicationId = "com.example.galaxywatch"
         minSdk = 30
@@ -81,7 +85,14 @@ dependencies {
 
 //    VOIP
     implementation("com.github.ZEGOCLOUD:zego_uikit_prebuilt_call_android:+")
+    // 1. Google's Firebase Messaging (The Alarm Clock)
+    implementation("com.google.firebase:firebase-messaging:23.4.0")
+// Use latest version
+    implementation("im.zego:zpns-fcm:2.8.0")
 
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
+    implementation("org.tensorflow:tensorflow-lite:2.16.1")
+// Optional but highly recommended for data formatting:
+    implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
 }
