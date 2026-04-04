@@ -14,27 +14,31 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccessibilityNew
 import androidx.compose.material.icons.filled.Favorite
-import androidx.compose.material.icons.filled.FlashOn
+import androidx.compose.material.icons.filled.MonitorHeart
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.health.connect.client.HealthConnectClient
-import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.OxygenSaturationRecord
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.response.ReadRecordsResponse
@@ -43,364 +47,621 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.wear.compose.material.*
 import com.example.galaxywatch.BackgroundVitalsService
-import com.example.galaxywatch.SharedVitals // --- NEW: Import the shared memory object! ---
+import com.example.galaxywatch.SharedVitals
 import com.example.galaxywatch.presentation.theme.GalaxyWatchTheme
-
-// --- ZEGOCLOUD IMPORTS ---
+import com.google.firebase.firestore.FirebaseFirestore
+import com.samsung.android.service.health.tracking.ConnectionListener
+import com.samsung.android.service.health.tracking.HealthTrackerException
+import com.samsung.android.service.health.tracking.HealthTrackingService
 import com.zegocloud.uikit.prebuilt.call.ZegoUIKitPrebuiltCallConfig
-import com.zegocloud.uikit.prebuilt.call.config.ZegoMenuBarButtonName
 import com.zegocloud.uikit.prebuilt.call.invite.ZegoUIKitPrebuiltCallInvitationConfig
 import com.zegocloud.uikit.prebuilt.call.invite.ZegoUIKitPrebuiltCallInvitationService
 import com.zegocloud.uikit.prebuilt.call.invite.internal.ZegoUIKitPrebuiltCallConfigProvider
 import com.zegocloud.uikit.prebuilt.call.invite.widget.ZegoSendCallInvitationButton
 import com.zegocloud.uikit.service.defines.ZegoUIKitUser
-
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.text.SimpleDateFormat
+import java.io.File
+import java.io.FileWriter
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.*
 
+// ─── Colour palette (dark, high-contrast — easy for elderly to read) ──────────
+private val CardBg        = Color(0xFF1C1C2E)
+private val AccentBlue    = Color(0xFF4FC3F7)
+private val AccentGreen   = Color(0xFF66BB6A)
+private val AccentRed     = Color(0xFFEF5350)
+private val AccentAmber   = Color(0xFFFFCA28)
+private val TextPrimary   = Color(0xFFFFFFFF)
+private val TextSecondary = Color(0xFFB0BEC5)
+private val DividerColor  = Color(0xFF2A2A3E)
+
+// ─── BP state machine ─────────────────────────────────────────────────────────
+sealed class BpState {
+    object Idle        : BpState()
+    object SensorError : BpState()
+    object TooNoisy    : BpState()
+    data class Measuring(val secondsLeft: Int) : BpState()
+    data class Result(val sbp: Int, val dbp: Int, val category: BpCategory) : BpState()
+}
+
+enum class BpCategory(val label: String, val color: Color) {
+    Normal("Normal",   AccentGreen),
+    Elevated("Elevated", AccentAmber),
+    High("High BP",    AccentRed),
+    Crisis("Crisis!",  AccentRed),
+}
+
+fun classifyBp(sbp: Int, dbp: Int): BpCategory = when {
+    sbp >= 180 || dbp >= 120 -> BpCategory.Crisis
+    sbp >= 140 || dbp >= 90  -> BpCategory.High
+    sbp >= 130 || dbp >= 80  -> BpCategory.Elevated
+    else                     -> BpCategory.Normal
+}
+
+// ─── Activity ─────────────────────────────────────────────────────────────────
+
 class MainActivity : ComponentActivity() {
+
+    private var healthTrackingService: HealthTrackingService? = null
+    var captureManager: PpgCaptureManager? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1. MULTIPLE PERMISSIONS LAUNCHER
         val permissionLauncher = registerForActivityResult(
             ActivityResultContracts.RequestMultiplePermissions()
-        ) { permissions ->
-            val sensorsGranted = permissions[Manifest.permission.BODY_SENSORS] ?: false
-            val micGranted = permissions[Manifest.permission.RECORD_AUDIO] ?: false
-
-            if (sensorsGranted) {
+        ) { perms ->
+            if (perms[Manifest.permission.BODY_SENSORS] == true) {
                 checkHealthConnectPermissions()
-                // START BACKGROUND SERVICE ONCE PERMISSIONS GRANTED
-                val serviceIntent = Intent(this, BackgroundVitalsService::class.java)
-                startForegroundService(serviceIntent)
+                startForegroundService(Intent(this, BackgroundVitalsService::class.java))
             }
-            if (!micGranted) {
-                Toast.makeText(this, "Mic is required for SOS Calls!", Toast.LENGTH_LONG).show()
+            if (perms[Manifest.permission.RECORD_AUDIO] != true) {
+                Toast.makeText(this, "Mic required for SOS calls!", Toast.LENGTH_LONG).show()
             }
         }
 
-        // --- ZEGOCLOUD INITIALIZATION ---
         initZegoCloud()
+        initSamsungHealthForUI()
 
         setContent {
-            // 2. CHECK WHICH PERMISSIONS ARE MISSING ON BOOT
-            val missingPermissions = mutableListOf<String>()
-
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BODY_SENSORS) != PackageManager.PERMISSION_GRANTED) {
-                missingPermissions.add(Manifest.permission.BODY_SENSORS)
-            }
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                missingPermissions.add(Manifest.permission.RECORD_AUDIO)
+            val missing = buildList {
+                if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.BODY_SENSORS)
+                    != PackageManager.PERMISSION_GRANTED) add(Manifest.permission.BODY_SENSORS)
+                if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO)
+                    != PackageManager.PERMISSION_GRANTED) add(Manifest.permission.RECORD_AUDIO)
             }
 
-            // 3. LAUNCH PERMISSION REQUEST IF NEEDED, OTHERWISE START SERVICE
-            if (missingPermissions.isNotEmpty()) {
-                LaunchedEffect(Unit) {
-                    permissionLauncher.launch(missingPermissions.toTypedArray())
-                }
+            if (missing.isNotEmpty()) {
+                LaunchedEffect(Unit) { permissionLauncher.launch(missing.toTypedArray()) }
             } else {
                 LaunchedEffect(Unit) {
                     checkHealthConnectPermissions()
-                    // START BACKGROUND SERVICE ON BOOT
-                    val serviceIntent = Intent(this@MainActivity, BackgroundVitalsService::class.java)
-                    startForegroundService(serviceIntent)
+                    startForegroundService(Intent(this@MainActivity, BackgroundVitalsService::class.java))
                 }
             }
 
-            MainAppLogic()
+            GalaxyWatchTheme { WearApp(this) }
         }
     }
 
-    private fun initZegoCloud() {
-        val sharedPrefs = getSharedPreferences("ElderCarePrefs", Context.MODE_PRIVATE)
-        val patientId = sharedPrefs.getString("PATIENT_ID", "patient_001") ?: "patient_001"
-        val appID: Long = 1279737711L
-        val appSign = "50a1c85a028c5224b00ec060afda1e71159d4cfdc124e124c441a981d83cd289"
-
-        val callInvitationConfig = ZegoUIKitPrebuiltCallInvitationConfig()
-
-        // --- NEW: OFFLINE PUSH NOTIFICATION CONFIGURATION ---
-        val notificationConfig = com.zegocloud.uikit.prebuilt.call.config.ZegoNotificationConfig()
-        notificationConfig.sound = "zego_uikit_sound_call"
-        notificationConfig.channelID = "CallInvitation"
-        notificationConfig.channelName = "CallInvitation"
-
-        // Attach the push config to your main config
-        callInvitationConfig.notificationConfig = notificationConfig
-        // ----------------------------------------------------
-
-        callInvitationConfig.provider = ZegoUIKitPrebuiltCallConfigProvider { _ ->
-            val config = ZegoUIKitPrebuiltCallConfig.oneOnOneVoiceCall()
-            config.useSpeakerWhenJoining = true
-            config.turnOnMicrophoneWhenJoining = true
-            config.topMenuBarConfig.isVisible = false
-            config
+    private fun initSamsungHealthForUI() {
+        val listener = object : ConnectionListener {
+            override fun onConnectionSuccess() {
+                Log.d("UI_SENSOR", "Samsung Health connected")
+                captureManager = PpgCaptureManager(healthTrackingService!!)
+            }
+            override fun onConnectionEnded() {}
+            override fun onConnectionFailed(e: HealthTrackerException?) {}
         }
+        healthTrackingService = HealthTrackingService(listener, this)
+        healthTrackingService?.connectService()
+    }
 
+    private fun initZegoCloud() {
+        val prefs     = getSharedPreferences("ElderCarePrefs", Context.MODE_PRIVATE)
+        val patientId = prefs.getString("PATIENT_ID", "patient_001") ?: "patient_001"
+
+        val invitationConfig = ZegoUIKitPrebuiltCallInvitationConfig()
+        val notifConfig = com.zegocloud.uikit.prebuilt.call.config.ZegoNotificationConfig()
+        notifConfig.sound       = "zego_uikit_sound_call"
+        notifConfig.channelID   = "CallInvitation"
+        notifConfig.channelName = "CallInvitation"
+        invitationConfig.notificationConfig = notifConfig
+        invitationConfig.provider = ZegoUIKitPrebuiltCallConfigProvider { _ ->
+            ZegoUIKitPrebuiltCallConfig.oneOnOneVoiceCall().also {
+                it.useSpeakerWhenJoining       = true
+                it.turnOnMicrophoneWhenJoining = true
+                it.topMenuBarConfig.isVisible  = false
+            }
+        }
         ZegoUIKitPrebuiltCallInvitationService.init(
-            application, appID, appSign, patientId, "Patient ($patientId)", callInvitationConfig
+            application,
+            1279737711L,
+            "50a1c85a028c5224b00ec060afda1e71159d4cfdc124e124c441a981d83cd289",
+            patientId,
+            "Patient ($patientId)",
+            invitationConfig
         )
     }
 
     override fun onDestroy() {
         super.onDestroy()
         ZegoUIKitPrebuiltCallInvitationService.unInit()
+        healthTrackingService?.disconnectService()
     }
 
     private fun checkHealthConnectPermissions() {
-        try {
-            val client = HealthConnectClient.getOrCreate(this)
-            val permissions = setOf(HealthPermission.getReadPermission(OxygenSaturationRecord::class))
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Health Connect not available or permissions missing", e)
-        }
+        try { HealthConnectClient.getOrCreate(this) }
+        catch (e: Exception) { Log.e("MainActivity", "Health Connect unavailable", e) }
     }
 }
 
-@Composable
-fun MainAppLogic() {
-    GalaxyWatchTheme {
-        WearApp()
-    }
-}
+// ─── Root UI ──────────────────────────────────────────────────────────────────
 
 @Composable
-fun WearApp() {
-    val context = LocalContext.current
+fun WearApp(activity: MainActivity) {
+    val context        = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    val scope = rememberCoroutineScope()
+    val scope          = rememberCoroutineScope()
 
-    // --- KEEP SCREEN ON ---
+    // Keep screen on
     DisposableEffect(Unit) {
-        val activity = context as? Activity
-        activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        onDispose {
-            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        }
+        val win = (context as? Activity)?.window
+        win?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        onDispose { win?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
     }
 
-    val healthConnectClient = remember {
-        try { HealthConnectClient.getOrCreate(context) }
-        catch (e: Exception) { null }
+    val healthClient = remember {
+        try { HealthConnectClient.getOrCreate(context) } catch (e: Exception) { null }
     }
 
-    // --- NEW: READ FROM SHARED MEMORY INSTEAD OF SENSORS ---
-    val heartRate by SharedVitals.heartRate.collectAsState()
-    val estimatedSys by SharedVitals.sys.collectAsState()
-    val estimatedDia by SharedVitals.dia.collectAsState()
-    val bpStatusText by SharedVitals.bpStatusText.collectAsState()
+    val heartRate    by SharedVitals.heartRate.collectAsState()
     val fallDetected by SharedVitals.fallDetected.collectAsState()
-    val fallMessage by SharedVitals.fallMessage.collectAsState()
+    val fallMessage  by SharedVitals.fallMessage.collectAsState()
 
-    // Calculate color based on the text string
-    val bpStatusColor = when(bpStatusText) {
-        "Normal" -> Color.Green
-        "Elevated" -> Color.Yellow
-        "High (Stage 1)" -> Color(0xFFFFA500)
-        else -> Color.Red
-    }
+    var bpState by remember { mutableStateOf<BpState>(BpState.Idle) }
+    var spo2    by remember { mutableStateOf("--") }
 
-    var spo2 by remember { mutableStateOf("--") }
-    var currentTime by remember { mutableStateOf(getCurrentTime()) }
-
-    // Read SpO2 ONLY when the screen wakes up
     DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                if (healthConnectClient != null) {
-                    scope.launch { spo2 = readLatestSpo2(healthConnectClient) }
-                } else {
-                    spo2 = ""
-                }
+        val obs = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME && healthClient != null) {
+                scope.launch { spo2 = readLatestSpo2(healthClient) }
             }
         }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
-    }
-
-    // Update the clock every second
-    LaunchedEffect(Unit) {
-        while (true) {
-            currentTime = getCurrentTime()
-            delay(1000)
-        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
     }
 
     Scaffold(
         timeText = { TimeText() },
-        modifier = Modifier.fillMaxSize()
+        modifier  = Modifier.fillMaxSize()
     ) {
-        Column(
-            modifier = Modifier.fillMaxSize().padding(1.dp),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
+        // ── ScalingLazyColumn keeps SOS always reachable by scrolling ─────
+        ScalingLazyColumn(
+            modifier            = Modifier.fillMaxSize(),
+            contentPadding      = PaddingValues(horizontal = 4.dp, vertical = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            state               = rememberScalingLazyListState()
         ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                HealthCard(modifier = Modifier.weight(0.3f)) {
-                    HeartbeatContent(heartRate = heartRate, currentTime = currentTime)
-                }
-                HealthCard(modifier = Modifier.weight(0.3f)) {
-                    BloodPressureContent(estimatedSys, estimatedDia, bpStatusText, bpStatusColor)
-                }
-            }
-            Spacer(modifier = Modifier.height(2.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                HealthCard(modifier = Modifier.weight(0.3f)) {
-                    IntentSpo2Content(spo2 = spo2)
-                }
-                HealthCard(
-                    modifier = Modifier.weight(0.3f),
-                    backgroundColor = if (fallDetected) Color.Red else MaterialTheme.colors.surface
+
+            // ── Item 1: Heart Rate | Blood Pressure ───────────────────────
+            item {
+                Row(
+                    modifier              = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    FallDetectionContent(isFallDetected = fallDetected, statusMessage = fallMessage)
+                    VitalCard(
+                        modifier = Modifier.weight(1f),
+                        icon     = Icons.Default.Favorite,
+                        iconTint = AccentRed,
+                        label    = "Heart Rate"
+                    ) {
+                        Text(
+                            text       = heartRate,
+                            fontSize   = 20.sp,
+                            fontWeight = FontWeight.Bold,
+                            color      = TextPrimary
+                        )
+                        Text(text = "bpm", fontSize = 9.sp, color = TextSecondary)
+                    }
+
+                    BpCard(
+                        modifier = Modifier.weight(1f),
+                        bpState  = bpState,
+                        onTap    = {
+                            if (bpState is BpState.Measuring) {
+                                Toast.makeText(context, "Already measuring…", Toast.LENGTH_SHORT).show()
+                                return@BpCard
+                            }
+                            if (activity.captureManager == null) {
+                                Toast.makeText(context, "Sensor connecting, please wait…", Toast.LENGTH_LONG).show()
+                                return@BpCard
+                            }
+                            scope.launch {
+                                runBpMeasurement(
+                                    captureManager = activity.captureManager!!,
+                                    context        = context,
+                                    onState        = { bpState = it }
+                                )
+                            }
+                        }
+                    )
                 }
             }
 
-            // --- ZEGOCLOUD SOS CALL BUTTON ---
-            Spacer(modifier = Modifier.height(4.dp))
-            AndroidView(
-                modifier = Modifier.size(36.dp),
-                factory = { ctx ->
-                    val themedContext = ContextThemeWrapper(ctx, android.R.style.Theme_DeviceDefault_NoActionBar)
-                    ZegoSendCallInvitationButton(themedContext).apply {
-                        setIsVideoCall(false)
-                        setInvitees(listOf(ZegoUIKitUser("5yeapeXNTZcofATleG5ZHZ8siZt2", "Caregiver")))
-                    } as android.view.View
+            // ── Item 2: SpO2 | Fall Detection ─────────────────────────────
+            item {
+                Row(
+                    modifier              = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    VitalCard(
+                        modifier = Modifier.weight(1f),
+                        icon     = Icons.Default.Favorite,
+                        iconTint = AccentBlue,
+                        label    = "SpO2"
+                    ) {
+                        Text(
+                            text       = spo2,
+                            fontSize   = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                            color      = TextPrimary
+                        )
+                        Spacer(Modifier.height(3.dp))
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(DividerColor)
+                                .clickable { launchSamsungHealthSpo2(context) }
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text       = "OPEN",
+                                fontSize   = 7.sp,
+                                color      = AccentBlue,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    VitalCard(
+                        modifier    = Modifier.weight(1f),
+                        icon        = if (fallDetected) Icons.Default.Warning else Icons.Default.AccessibilityNew,
+                        iconTint    = if (fallDetected) AccentRed else AccentGreen,
+                        label       = "Fall Status",
+                        bgColor     = if (fallDetected) AccentRed.copy(alpha = 0.2f) else CardBg,
+                        borderColor = if (fallDetected) AccentRed else DividerColor
+                    ) {
+                        Text(
+                            text       = fallMessage,
+                            fontSize   = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color      = if (fallDetected) AccentRed else AccentGreen,
+                            textAlign  = TextAlign.Center
+                        )
+                    }
                 }
-            )
+            }
+
+            // ── Item 3: SOS button — always scrollable into view ──────────
+            item {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(text = "SOS CALL", fontSize = 7.sp, color = TextSecondary)
+                    Spacer(Modifier.height(2.dp))
+                    AndroidView(
+                        modifier = Modifier.size(40.dp),
+                        factory  = { ctx ->
+                            val themed = ContextThemeWrapper(
+                                ctx, android.R.style.Theme_DeviceDefault_NoActionBar
+                            )
+                            ZegoSendCallInvitationButton(themed).apply {
+                                setIsVideoCall(false)
+                                setInvitees(listOf(ZegoUIKitUser("5yeapeXNTZcofATleG5ZHZ8siZt2", "Caregiver")))
+                            } as android.view.View
+                        }
+                    )
+                }
+            }
         }
     }
 }
 
-// --- HELPER FUNCTIONS ---
+// ─── BP measurement logic ─────────────────────────────────────────────────────
+
+private suspend fun runBpMeasurement(
+    captureManager: PpgCaptureManager,
+    context:        Context,
+    onState:        (BpState) -> Unit
+) {
+    captureManager.startRecording()
+
+    for (i in 30 downTo 1) {
+        onState(BpState.Measuring(i))
+        delay(1000L)
+    }
+
+    val rawData = captureManager.stopRecording()
+    exportDataToCsv(context, rawData)
+
+    if (rawData.isEmpty()) {
+        onState(BpState.SensorError)
+        Log.e("BP_MEASURE", "Raw data empty")
+        return
+    }
+
+    Log.d("BP_MEASURE", "Raw points: ${rawData.size}")
+
+    val cropped = if (rawData.size > 75) rawData.subList(75, rawData.size) else rawData
+
+    val filtered = ArrayList<SensorReading>(cropped.size)
+    var smoothed = cropped[0].value
+    var baseline = cropped[0].value
+    for (r in cropped) {
+        smoothed += 0.3f * (r.value - smoothed)
+        baseline += 0.02f * (smoothed - baseline)
+        filtered.add(SensorReading(r.timestamp, smoothed - baseline))
+    }
+
+    val variance  = filtered.sumOf { (it.value * it.value).toDouble() } / filtered.size
+    val threshold = Math.sqrt(variance).toFloat() * 0.3f
+
+    val peaks    = mutableListOf<Long>()
+    var lastPeak = 0L
+    for (i in 1 until filtered.size - 1) {
+        val p = filtered[i - 1].value
+        val c = filtered[i].value
+        val n = filtered[i + 1].value
+        if (c > p && c >= n && c > threshold && filtered[i].timestamp - lastPeak > 400) {
+            peaks.add(filtered[i].timestamp)
+            lastPeak = filtered[i].timestamp
+        }
+    }
+
+    Log.d("BP_MEASURE", "Peaks: ${peaks.size}")
+
+    if (peaks.size < 5) {
+        onState(BpState.TooNoisy)
+        return
+    }
+
+    val meanIbi = (1 until peaks.size).map { peaks[it] - peaks[it - 1] }.average()
+    val ibi     = (meanIbi / 1000.0).toFloat()
+    val hr      = 60f / ibi
+
+    val sbpRaw = (-2.1238 * hr) + (-303.3449 * ibi) + 537.4787
+    val dbpRaw = (-2.8673 * hr) + (-320.2307 * ibi) + 555.7767
+
+    val sbp = sbpRaw.toInt().coerceIn(60, 220)
+    val dbp = dbpRaw.toInt().coerceIn(40, 140)
+
+    Log.d("BP_MEASURE", "HR=${hr.toInt()}bpm IBI=${ibi}s → SBP=$sbp DBP=$dbp")
+
+    val category = classifyBp(sbp, dbp)
+
+    // Update UI
+    onState(BpState.Result(sbp, dbp, category))
+
+    // Save to Firebase
+    saveBpToFirebase(context, sbp, dbp, category)
+}
+
+// ─── Firebase save ────────────────────────────────────────────────────────────
+
+fun saveBpToFirebase(
+    context:  Context,
+    sbp:      Int,
+    dbp:      Int,
+    category: BpCategory
+) {
+    val prefs     = context.getSharedPreferences("ElderCarePrefs", Context.MODE_PRIVATE)
+    val patientId = prefs.getString("PATIENT_ID", "patient_001") ?: "patient_001"
+    val db        = FirebaseFirestore.getInstance()
+
+    val bpString  = "$sbp/$dbp"
+    val timestamp = System.currentTimeMillis()
+
+    // 1. Data for the root document (Live UI Updates)
+    val liveUpdates = mapOf(
+        "bloodPressure" to bpString,
+        "bpStatus"      to category.label
+        // Note: We don't overwrite the main timestamp here so we don't mess up the heart rate sync timing
+    )
+
+    // 2. Data for the subcollection (Historical Logging)
+    val historyData = mapOf(
+        "bloodPressure" to bpString,
+        "bpStatus"      to category.label,
+        "systolic"      to sbp,
+        "diastolic"     to dbp,
+        "timestamp"     to timestamp
+    )
+
+    val patientRef = db.collection("patients").document(patientId)
+
+    // Update the main fields on the patient_001 document
+    patientRef.set(liveUpdates, com.google.firebase.firestore.SetOptions.merge())
+        .addOnFailureListener { e ->
+            Log.e("BP_FIREBASE", "❌ Failed to update main BP fields", e)
+        }
+
+    // Save the new document into the "blood_pressure" subcollection
+    patientRef.collection("blood_pressure")
+        .document(timestamp.toString())
+        .set(historyData)
+        .addOnSuccessListener {
+            Log.d("BP_FIREBASE", "✅ Saved BP to subcollection: $bpString (${category.label})")
+        }
+        .addOnFailureListener { e ->
+            Log.e("BP_FIREBASE", "❌ Failed to save BP history", e)
+        }
+}
+
+// ─── BP card ──────────────────────────────────────────────────────────────────
+
+@Composable
+fun BpCard(modifier: Modifier, bpState: BpState, onTap: () -> Unit) {
+    val borderColor = when (bpState) {
+        is BpState.Result      -> bpState.category.color
+        is BpState.Measuring   -> AccentBlue
+        is BpState.TooNoisy    -> AccentAmber
+        is BpState.SensorError -> AccentRed
+        else                   -> DividerColor
+    }
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(CardBg)
+            .border(1.dp, borderColor, RoundedCornerShape(12.dp))
+            .clickable { onTap() }
+            .padding(6.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(
+                imageVector        = Icons.Default.MonitorHeart,
+                contentDescription = "BP",
+                tint               = AccentBlue,
+                modifier           = Modifier.size(12.dp)
+            )
+            Text(text = "Blood Pressure", fontSize = 7.sp, color = TextSecondary)
+            Spacer(Modifier.height(3.dp))
+
+            when (bpState) {
+                is BpState.Idle -> {
+                    Text("Tap to",  fontSize = 9.sp,  color = TextSecondary)
+                    Text("Measure", fontSize = 10.sp, color = AccentBlue, fontWeight = FontWeight.Bold)
+                }
+                is BpState.Measuring -> {
+                    Text(
+                        text       = "${bpState.secondsLeft}s",
+                        fontSize   = 22.sp,
+                        fontWeight = FontWeight.Bold,
+                        color      = AccentBlue
+                    )
+                    Text("Hold still", fontSize = 8.sp, color = TextSecondary)
+                }
+                is BpState.Result -> {
+                    Text(
+                        text       = "${bpState.sbp}",
+                        fontSize   = 22.sp,
+                        fontWeight = FontWeight.Bold,
+                        color      = bpState.category.color
+                    )
+                    Text(
+                        text     = "${bpState.dbp} mmHg",
+                        fontSize = 10.sp,
+                        color    = TextSecondary
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(bpState.category.color.copy(alpha = 0.2f))
+                            .padding(horizontal = 5.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text       = bpState.category.label,
+                            fontSize   = 8.sp,
+                            fontWeight = FontWeight.Bold,
+                            color      = bpState.category.color
+                        )
+                    }
+                    Spacer(Modifier.height(2.dp))
+                    Text("Tap to retry", fontSize = 7.sp, color = TextSecondary)
+                }
+                is BpState.TooNoisy -> {
+                    Text("Too Noisy", fontSize = 9.sp, color = AccentAmber, fontWeight = FontWeight.Bold)
+                    Text("Tap retry", fontSize = 8.sp, color = TextSecondary)
+                }
+                is BpState.SensorError -> {
+                    Text("Sensor", fontSize = 9.sp, color = AccentRed, fontWeight = FontWeight.Bold)
+                    Text("Error",  fontSize = 9.sp, color = AccentRed)
+                }
+            }
+        }
+    }
+}
+
+// ─── Generic vital card ───────────────────────────────────────────────────────
+
+@Composable
+fun VitalCard(
+    modifier:    Modifier,
+    icon:        ImageVector,
+    iconTint:    Color,
+    label:       String,
+    bgColor:     Color = CardBg,
+    borderColor: Color = DividerColor,
+    content:     @Composable ColumnScope.() -> Unit
+) {
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(bgColor)
+            .border(1.dp, borderColor, RoundedCornerShape(12.dp))
+            .padding(6.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(icon, label, tint = iconTint, modifier = Modifier.size(12.dp))
+            Text(text = label, fontSize = 7.sp, color = TextSecondary)
+            Spacer(Modifier.height(3.dp))
+            content()
+        }
+    }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+fun exportDataToCsv(context: Context, data: List<SensorReading>) {
+    if (data.isEmpty()) return
+    try {
+        val file = File(context.getExternalFilesDir(null), "PPG_RawData_${System.currentTimeMillis()}.csv")
+        FileWriter(file).use { w ->
+            w.append("Timestamp,PPG_Value\n")
+            for (r in data) w.append("${r.timestamp},${r.value}\n")
+        }
+        Log.d("CSV_EXPORT", "Saved: ${file.absolutePath}")
+    } catch (e: Exception) {
+        Log.e("CSV_EXPORT", "Failed", e)
+    }
+}
 
 fun launchSamsungHealthSpo2(context: Context) {
-    val packages = listOf("com.sec.android.app.shealth", "com.samsung.android.wear.shealth")
-    val deepLink = "shealth://oxygen_saturation"
-
-    for (packageName in packages) {
+    for (pkg in listOf("com.sec.android.app.shealth", "com.samsung.android.wear.shealth")) {
         try {
-            val launchIntent = context.packageManager.getLaunchIntentForPackage(packageName)
-            if (launchIntent != null) {
-                try {
-                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(deepLink))
-                    intent.setPackage(packageName)
-                    intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                    context.startActivity(intent)
-                    return
-                } catch (e: Exception) {
-                    context.startActivity(launchIntent)
-                    return
-                }
-            }
-        } catch (e: Exception) { }
-    }
-    Toast.makeText(context, "Samsung Health app not installed", Toast.LENGTH_SHORT).show()
-}
-
-suspend fun readLatestSpo2(client: HealthConnectClient): String {
-    return try {
-        val response: ReadRecordsResponse<OxygenSaturationRecord> = client.readRecords(
-            ReadRecordsRequest(
-                recordType = OxygenSaturationRecord::class,
-                timeRangeFilter = TimeRangeFilter.between(
-                    startTime = Instant.now().minus(24, ChronoUnit.HOURS),
-                    endTime = Instant.now()
-                ),
-                ascendingOrder = false,
-                pageSize = 1
+            context.startActivity(
+                Intent(Intent.ACTION_VIEW, Uri.parse("shealth://oxygen_saturation"))
+                    .setPackage(pkg)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )
-        )
-        val record = response.records.firstOrNull()
-        if (record != null) "${record.percentage.value.toInt()}%" else "No Data"
-    } catch (e: Exception) {
-        Log.e("SPO2", "Error reading health connect", e)
-        "Perm needed"
-    }
-}
-
-fun getCurrentTime(): String {
-    val sdf = SimpleDateFormat("HH:mm", Locale.getDefault())
-    return sdf.format(Date())
-}
-
-// --- COMPOSABLES ---
-
-@Composable
-fun HealthCard(
-    modifier: Modifier = Modifier,
-    backgroundColor: Color = MaterialTheme.colors.surface,
-    content: @Composable () -> Unit
-) {
-    Card(
-        onClick = {},
-        modifier = modifier.clip(RoundedCornerShape(12.dp)),
-        backgroundPainter = CardDefaults.cardBackgroundPainter(
-            startBackgroundColor = backgroundColor,
-            endBackgroundColor = backgroundColor
-        )
-    ) {
-        Box(modifier = Modifier.padding(2.dp)) { content() }
-    }
-}
-
-@Composable
-fun IntentSpo2Content(spo2: String) {
-    val context = LocalContext.current
-    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-        Icon(Icons.Default.Favorite, "SPO2", tint = Color.Cyan, modifier = Modifier.size(12.dp))
-        Text("SPO2 Level", fontWeight = FontWeight.Bold, fontSize = 8.sp)
-        Spacer(modifier = Modifier.height(1.dp))
-        Text(spo2, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-        Spacer(modifier = Modifier.height(4.dp))
-        Button(
-            onClick = { launchSamsungHealthSpo2(context) },
-            modifier = Modifier.height(20.dp),
-            colors = ButtonDefaults.buttonColors(backgroundColor = MaterialTheme.colors.surface)
-        ) {
-            Text("OPEN APP", fontSize = 6.sp, fontWeight = FontWeight.Bold)
+            return
+        } catch (_: Exception) {
+            try {
+                context.packageManager.getLaunchIntentForPackage(pkg)
+                    ?.let { context.startActivity(it); return }
+            } catch (_: Exception) {}
         }
     }
+    Toast.makeText(context, "Samsung Health not installed", Toast.LENGTH_SHORT).show()
 }
 
-@Composable
-fun HeartbeatContent(heartRate: String, currentTime: String) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-        Icon(Icons.Default.Favorite, "Heartbeat", tint = MaterialTheme.colors.primary, modifier = Modifier.size(12.dp))
-        Text("Heartbeat", fontWeight = FontWeight.Bold, fontSize = 8.sp)
-        Spacer(modifier = Modifier.height(1.dp))
-        Text("$heartRate bpm", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-        Text(currentTime, fontSize = 6.sp, color = MaterialTheme.colors.onSurface)
-    }
-}
-
-@Composable
-fun BloodPressureContent(systolic: Int, diastolic: Int, status: String, color: Color) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-        Icon(Icons.Default.FlashOn, "BP", tint = MaterialTheme.colors.primary, modifier = Modifier.size(12.dp))
-        Text("BP (Est.)", fontWeight = FontWeight.Bold, fontSize = 8.sp)
-        Spacer(modifier = Modifier.height(1.dp))
-        Text("$systolic/$diastolic", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
-        Text(status, fontSize = 8.sp, fontWeight = FontWeight.Bold, color = color)
-    }
-}
-
-@Composable
-fun FallDetectionContent(isFallDetected: Boolean, statusMessage: String) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-        Icon(
-            if (isFallDetected) Icons.Default.Warning else Icons.Default.AccessibilityNew,
-            "Fall",
-            tint = if (isFallDetected) Color.White else MaterialTheme.colors.primary,
-            modifier = Modifier.size(12.dp)
+suspend fun readLatestSpo2(client: HealthConnectClient): String = try {
+    val resp: ReadRecordsResponse<OxygenSaturationRecord> = client.readRecords(
+        ReadRecordsRequest(
+            recordType      = OxygenSaturationRecord::class,
+            timeRangeFilter = TimeRangeFilter.between(
+                Instant.now().minus(24, ChronoUnit.HOURS), Instant.now()
+            ),
+            ascendingOrder = false,
+            pageSize       = 1
         )
-        Text("Fall Status", fontWeight = FontWeight.Bold, fontSize = 8.sp, color = if (isFallDetected) Color.White else MaterialTheme.colors.onSurface)
-        Spacer(modifier = Modifier.height(1.dp))
-        Text(statusMessage, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = if (isFallDetected) Color.White else MaterialTheme.colors.onSurface)
-    }
+    )
+    resp.records.firstOrNull()?.let { "${it.percentage.value.toInt()}%" } ?: "No Data"
+} catch (e: Exception) {
+    Log.e("SPO2", "Health Connect error", e)
+    "Perm needed"
 }

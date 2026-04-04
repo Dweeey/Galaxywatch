@@ -11,22 +11,25 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import androidx.health.services.client.HealthServices
-import androidx.health.services.client.MeasureCallback
-import androidx.health.services.client.data.Availability
-import androidx.health.services.client.data.DataPointContainer
-import androidx.health.services.client.data.DataType
-import androidx.health.services.client.data.DeltaDataType
 import com.google.firebase.firestore.SetOptions
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlin.math.sqrt
 
-// 🚨 NEW: TensorFlow Lite Imports
+// Samsung Privileged Health SDK Imports
+import com.samsung.android.service.health.tracking.ConnectionListener
+import com.samsung.android.service.health.tracking.HealthTracker
+import com.samsung.android.service.health.tracking.HealthTrackerException
+import com.samsung.android.service.health.tracking.HealthTrackingService
+import com.samsung.android.service.health.tracking.data.DataPoint
+import com.samsung.android.service.health.tracking.data.HealthTrackerType
+import com.samsung.android.service.health.tracking.data.ValueKey
+
+// Local Fall Detection Brain Imports
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
 import java.nio.channels.FileChannel
@@ -39,256 +42,66 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
     // Hardware Sensors
     private var accelerometer: Sensor? = null
-    private var offBodySensor: Sensor? = null // NEW: Off-wrist sensor
+    private var offBodySensor: Sensor? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
-    // 🚨 NEW: AI Variables
+    // Samsung SDK Variables
+    private var healthTrackingService: HealthTrackingService? = null
+    private var hrTracker: HealthTracker? = null
+
+    // AI Variables
     private var tflite: Interpreter? = null
     private val sensorBuffer = FloatArray(512)
-    private var bufferIndex = 0
+
+    // FIX: @Volatile prevents stale reads across threads
+    @Volatile private var bufferIndex = 0
+
+    // FIX: Lock object to prevent race conditions on the buffer
+    private val bufferLock = Any()
 
     // State Variables
-    private var currentHeartRate = "--"
-    private var estimatedSys = 120
-    private var estimatedDia = 80
-    private var bpStatusText = "Normal"
+    private var currentHeartRate = "Scanning..."
     private var fallDetected = false
     private var fallMessage = "Scanning..."
-    private var isWatchOnWrist = true // NEW: Battery saver flag
+    private var isWatchOnWrist = true
 
-    private val measureClient by lazy { HealthServices.getClient(this).measureClient }
+    // ─────────────────────────────────────────────
+    // LIFECYCLE
+    // ─────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
-        startForegroundServiceNotification()
 
-        // 🚨 NEW: Load the AI Brain
-        loadAIBrain()
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "ElderCare::VitalsWakeLock"
+        )
+        wakeLock?.acquire()
+
+        startForegroundServiceNotification()
+        loadLocalAIBrain()
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
 
-        // 1. Start Fall Detection
+        // FIX: Use 20000 microseconds = 50Hz to match training data sampling rate.
+        // SENSOR_DELAY_GAME runs at ~200Hz which mismatches the model's expected input.
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         accelerometer?.let {
-            // Using SENSOR_DELAY_GAME for faster AI data collection
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+            sensorManager.registerListener(this, it, 20000)
         }
 
-        // 2. Start Off-Body Detection
         offBodySensor = sensorManager.getDefaultSensor(Sensor.TYPE_LOW_LATENCY_OFFBODY_DETECT)
         offBodySensor?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
         }
 
-        // 3. Start Heart Rate Monitor
-        startHeartRateMonitoring()
+        // Boot up the Samsung Health SDK
+        healthTrackingService = HealthTrackingService(samsungConnectionListener, this)
+        healthTrackingService?.connectService()
 
-        // 4. Start the Firebase Sync Loop (Every 60 Seconds)
-        startFirebaseSyncLoop()
-    }
-
-    // 🚨 NEW: Load the TFLite Model from the assets folder
-    private fun loadAIBrain() {
-        try {
-            val fileDescriptor = assets.openFd("sisfall_brain.tflite")
-            val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
-            val fileChannel = inputStream.channel
-            val startOffset = fileDescriptor.startOffset
-            val declaredLength = fileDescriptor.declaredLength
-            val tfliteModel = fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
-
-            tflite = Interpreter(tfliteModel)
-            Log.d("FALL_AI", "Brain successfully loaded!")
-        } catch (e: Exception) {
-            Log.e("FALL_AI", "Error loading AI Brain: ${e.message}")
-        }
-    }
-
-    private fun startForegroundServiceNotification() {
-        // ID changed to build a silent channel
-        val channelId = "VitalsServiceChannel_Silent"
-
-        val channel = NotificationChannel(
-            channelId,
-            "Health Monitoring Service",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            // Disable all buzzing and sounds
-            enableVibration(false)
-            vibrationPattern = longArrayOf(0L)
-            setSound(null, null)
-        }
-
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(channel)
-
-        val notification: Notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("ElderCare Active")
-            .setContentText("Monitoring vitals in background...")
-            .setSmallIcon(android.R.drawable.ic_menu_info_details)
-            .setOngoing(true)
-            .build()
-
-        startForeground(1, notification)
-    }
-
-    private fun startHeartRateMonitoring() {
-        val callback = object : MeasureCallback {
-            override fun onAvailabilityChanged(dataType: DeltaDataType<*, *>, availability: Availability) {}
-            override fun onDataReceived(data: DataPointContainer) {
-                // Only process heart rate if the watch is actually on the wrist!
-                if (!isWatchOnWrist) return
-
-                val latestHr = data.getData(DataType.HEART_RATE_BPM).lastOrNull()?.value
-                if (latestHr != null && latestHr > 0.0) {
-                    val hrInt = latestHr.toInt()
-                    currentHeartRate = hrInt.toString()
-
-                    // Estimate BP
-                    val diff = hrInt - 70
-                    estimatedSys = 115 + (diff * 0.5).toInt()
-                    estimatedDia = 75 + (diff * 0.2).toInt()
-
-                    bpStatusText = when {
-                        estimatedSys < 120 && estimatedDia < 80 -> "Normal"
-                        estimatedSys < 130 && estimatedDia < 80 -> "Elevated"
-                        estimatedSys < 140 || estimatedDia < 90 -> "High (Stage 1)"
-                        else -> "High (Stage 2)"
-                    }
-                }
-            }
-        }
-
-        serviceScope.launch {
-            try {
-                measureClient.registerMeasureCallback(DataType.HEART_RATE_BPM, callback)
-            } catch (e: Exception) {
-                Log.e("VitalsService", "Failed to register HR callback", e)
-            }
-        }
-    }
-
-    override fun onSensorChanged(event: SensorEvent?) {
-        // --- 1. AI FALL DETECTION LOGIC ---
-        if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER) {
-
-            // Only feed data to the AI if the watch is actually being worn
-            if (isWatchOnWrist) {
-                if (bufferIndex < 510) {
-                    sensorBuffer[bufferIndex++] = event.values[0] // X
-                    sensorBuffer[bufferIndex++] = event.values[1] // Y
-                    sensorBuffer[bufferIndex++] = event.values[2] // Z
-                }
-
-                // When the buffer hits 512, ask the AI to make a prediction
-                if (bufferIndex >= 512) {
-                    runFallDetectionInference()
-                    bufferIndex = 0 // Reset buffer for the next batch
-                }
-            }
-        }
-
-        // --- 2. OFF-WRIST DETECTION LOGIC ---
-        if (event?.sensor?.type == Sensor.TYPE_LOW_LATENCY_OFFBODY_DETECT) {
-            // event.values[0] returns 1.0 if ON body, 0.0 if OFF body
-            val currentlyOnBody = event.values[0] != 0f
-
-            if (isWatchOnWrist != currentlyOnBody) {
-                isWatchOnWrist = currentlyOnBody
-
-                if (!isWatchOnWrist) {
-                    // WATCH TAKEN OFF!
-                    currentHeartRate = "--"
-                    bpStatusText = "Watch Off Wrist"
-                    bufferIndex = 0 // 🚨 NEW: Clear half-finished AI data
-                    pushToFirebase() // Instantly tell Caregiver
-                } else {
-                    // WATCH PUT BACK ON!
-                    bpStatusText = "Scanning..."
-                    pushToFirebase() // Instantly tell Caregiver
-                }
-            }
-        }
-    }
-
-    // 🚨 NEW: AI Inference Function
-    private fun runFallDetectionInference() {
-        if (tflite == null) return
-
-        val input = arrayOf(sensorBuffer)
-        val output = arrayOf(FloatArray(3))
-
-        try {
-            tflite?.run(input, output)
-            val fallProbability = output[0][1] // Assuming Index 1 is the 'Fall' probability
-
-            // If the AI is >85% sure it's a fall, AND we aren't already alarming...
-            if (fallProbability > 0.85f && !fallDetected) {
-                val confidence = (fallProbability * 100).toInt()
-
-                fallDetected = true
-                fallMessage = "AI DETECTED! ($confidence%)"
-                pushToFirebase() // Instantly alert Caregiver
-
-                // Wait 5 seconds, then reset the alarm
-                serviceScope.launch {
-                    delay(5000)
-                    if (isWatchOnWrist) { // Only reset if they didn't take the watch off
-                        fallDetected = false
-                        fallMessage = "Scanning..."
-                        pushToFirebase()
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e("FALL_AI", "Inference crashed: ${e.message}")
-        }
-    }
-
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
-
-    private fun startFirebaseSyncLoop() {
-        serviceScope.launch {
-            while (isActive) {
-                // Only do the heavy Firebase push if the watch is actually being worn!
-                if (isWatchOnWrist) {
-                    pushToFirebase()
-                }
-                delay(60 * 1000L) // Wait 60 seconds
-            }
-        }
-    }
-
-    private fun pushToFirebase() {
-        val currentTimeMillis = System.currentTimeMillis()
-        val patientRef = db.collection("patients").document("patient_001")
-
-        // --- UPDATE THE UI FIRST ---
-        SharedVitals.heartRate.value = currentHeartRate
-        SharedVitals.sys.value = estimatedSys
-        SharedVitals.dia.value = estimatedDia
-        SharedVitals.bpStatusText.value = bpStatusText
-        SharedVitals.fallDetected.value = fallDetected
-        SharedVitals.fallMessage.value = fallMessage
-
-        // 1. LIVE DASHBOARD UPDATE (Selective Update so SpO2 is safe!)
-        val liveUpdates = hashMapOf<String, Any>(
-            "heartRate" to currentHeartRate,
-            "bloodPressure" to "$estimatedSys/$estimatedDia",
-            "bpStatus" to bpStatusText,
-            "fallDetected" to fallDetected,
-            "statusMessage" to fallMessage,
-            "timestamp" to currentTimeMillis
-        )
-
-        patientRef.update(liveUpdates)
-            .addOnFailureListener {
-                patientRef.set(liveUpdates, SetOptions.merge())
-            }
-
-        // 2. HISTORY LOG UPDATE (Keeps the ledger intact)
-        val historyData = liveUpdates.clone() as HashMap<String, Any>
-        patientRef.collection("history").document(currentTimeMillis.toString())
-            .set(historyData)
+        // Start the throttled Firebase sync loop
+        startSyncLoop()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -297,16 +110,301 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         super.onDestroy()
         serviceScope.cancel()
         sensorManager.unregisterListener(this)
-        tflite?.close() // 🚨 NEW: Clean up the AI memory when service dies
+        hrTracker?.unsetEventListener()
+        healthTrackingService?.disconnectService()
+        tflite?.close()
+        wakeLock?.release()
+    }
+
+    // ─────────────────────────────────────────────
+    // SAMSUNG HEALTH SDK
+    // ─────────────────────────────────────────────
+
+    private val samsungConnectionListener = object : ConnectionListener {
+        override fun onConnectionSuccess() {
+            Log.d("SAMSUNG_SDK", "✅ Connected to Samsung Health Platform!")
+            try {
+                hrTracker = healthTrackingService?.getHealthTracker(
+                    HealthTrackerType.HEART_RATE_CONTINUOUS
+                )
+                hrTracker?.setEventListener(hrListener)
+            } catch (e: Exception) {
+                Log.e("SAMSUNG_SDK", "Failed to open HR tracker: ${e.message}")
+            }
+        }
+
+        override fun onConnectionEnded() {
+            Log.d("SAMSUNG_SDK", "Disconnected from Health Platform.")
+        }
+
+        override fun onConnectionFailed(e: HealthTrackerException?) {
+            Log.e("SAMSUNG_SDK", "Connection Failed. Is Samsung Developer Mode enabled?")
+        }
+    }
+
+    private val hrListener = object : HealthTracker.TrackerEventListener {
+        override fun onDataReceived(dataList: List<DataPoint>) {
+            if (!isWatchOnWrist) return
+            for (data in dataList) {
+                try {
+                    val hr = data.getValue(ValueKey.HeartRateSet.HEART_RATE) as? Int ?: continue
+                    if (hr > 0) {
+                        currentHeartRate = hr.toString()
+                    }
+                } catch (e: Exception) {
+                    Log.e("SAMSUNG_SDK", "HR read error: ${e.message}")
+                }
+            }
+        }
+
+        override fun onFlushCompleted() {}
+        override fun onError(e: HealthTracker.TrackerError?) {}
+    }
+
+    // ─────────────────────────────────────────────
+    // AI BRAIN LOADER
+    // ─────────────────────────────────────────────
+
+    private fun loadLocalAIBrain() {
+        try {
+            val fileDescriptor = assets.openFd("wedafall_brain.tflite")
+            val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
+            val fileChannel = inputStream.channel
+            val mappedBuffer = fileChannel.map(
+                FileChannel.MapMode.READ_ONLY,
+                fileDescriptor.startOffset,
+                fileDescriptor.declaredLength
+            )
+            val options = Interpreter.Options().apply {
+                setNumThreads(2)
+            }
+            tflite = Interpreter(mappedBuffer, options)
+            Log.d("FALL_AI", "✅ Brain loaded successfully")
+        } catch (e: Exception) {
+            Log.e("FALL_AI", "❌ Failed to load brain: ${e.message}")
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // SENSOR EVENTS
+    // ─────────────────────────────────────────────
+
+    override fun onSensorChanged(event: SensorEvent?) {
+
+        // ── Accelerometer → Fall Detection ──
+        if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER && isWatchOnWrist) {
+            val ax = event.values[0]
+            val ay = event.values[1]
+            val az = event.values[2]
+
+            // FIX: Compute magnitude — matches training preprocessing exactly.
+            // Training used sqrt(ax²+ay²+az²), NOT raw XYZ channels.
+            val magnitude = Math.sqrt(
+                (ax * ax + ay * ay + az * az).toDouble()
+            ).toFloat()
+
+            // FIX: synchronized block prevents buffer corruption from
+            // simultaneous reads/writes across the sensor and IO threads.
+            synchronized(bufferLock) {
+                if (bufferIndex < 512) {
+                    sensorBuffer[bufferIndex++] = magnitude
+                }
+
+                if (bufferIndex >= 512) {
+                    // Snapshot the buffer for inference (fast, stays on sensor thread)
+                    val snapshot = sensorBuffer.copyOf()
+
+                    // FIX: Sliding window — keep last 256 samples (50% overlap).
+                    // This means inference runs every 256 new samples instead of
+                    // every 512, so falls near window boundaries are never missed.
+                    System.arraycopy(sensorBuffer, 256, sensorBuffer, 0, 256)
+                    bufferIndex = 256
+
+                    // FIX: Run inference on IO thread, NOT the sensor/UI thread.
+                    // Inference takes ~10–50ms and would cause ANR crashes on main thread.
+                    serviceScope.launch {
+                        runFallDetectionInference(snapshot)
+                    }
+                }
+            }
+        }
+
+        // ── Off-Body Sensor → Wrist Detection ──
+        if (event?.sensor?.type == Sensor.TYPE_LOW_LATENCY_OFFBODY_DETECT) {
+            val currentlyOnBody = event.values[0] != 0f
+            if (isWatchOnWrist != currentlyOnBody) {
+                isWatchOnWrist = currentlyOnBody
+
+                if (!isWatchOnWrist) {
+                    // Watch removed — clear stale data
+                    currentHeartRate = "--"
+                    // FIX: Reset buffer so old movement data doesn't
+                    // contaminate the next session when watch is put back on.
+                    synchronized(bufferLock) { bufferIndex = 0 }
+                }
+
+                // Push wrist state change immediately
+                pushDataUpdates()
+            }
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+    // ─────────────────────────────────────────────
+    // FALL DETECTION INFERENCE
+    // ─────────────────────────────────────────────
+
+    private fun runFallDetectionInference(buffer: FloatArray) {
+        if (tflite == null) return
+
+        // FIX: Per-window normalization — must match training preprocessing.
+        // Training normalized each window to zero mean and unit std deviation.
+        val mean = buffer.average().toFloat()
+        val std = Math.sqrt(
+            buffer.map { ((it - mean) * (it - mean)).toDouble() }.average()
+        ).toFloat()
+
+        val normalizedBuffer = if (std > 0f) {
+            FloatArray(512) { i -> (buffer[i] - mean) / std }
+        } else {
+            buffer.copyOf()
+        }
+
+        // FIX: Correct input shape (1, 512, 1) — Conv1D expects 3D tensor.
+        // Using .also{} ensures each FloatArray(1) is properly initialized
+        // before being passed to the interpreter.
+        val input = Array(1) {
+            Array(512) { i ->
+                FloatArray(1).also { it[0] = normalizedBuffer[i] }
+            }
+        }
+
+        // FIX: Correct output shape (1, 1) — model outputs a single float
+        // probability between 0.0 and 1.0. Previous code used FloatArray(3)
+        // which caused index [1] to always return 0.0 (no fall detected).
+        val output = Array(1) { FloatArray(1) }
+
+        try {
+            tflite?.run(input, output)
+            val fallProbability = output[0][0]
+
+            Log.d("FALL_AI", "Fall probability: ${"%.3f".format(fallProbability)}")
+
+            // FIX: Threshold is 0.2 for elderly users (not 0.85).
+            // Lower threshold catches slower, lower-impact falls typical in elderly.
+            // The model was trained and validated at this threshold (86% recall).
+            if (fallProbability > 0.2f && !fallDetected) {
+                fallDetected = true
+                fallMessage = "FALL DETECTED! (${(fallProbability * 100).toInt()}%)"
+
+                Log.w("FALL_AI", "🚨 $fallMessage")
+
+                // Push emergency update immediately to Firebase + UI
+                pushDataUpdates()
+
+                // Auto-reset after 10 seconds if watch still on wrist
+                serviceScope.launch {
+                    delay(10_000L)
+                    if (isWatchOnWrist) {
+                        fallDetected = false
+                        fallMessage = "Scanning..."
+                        pushDataUpdates()
+                    }
+                }
+            }
+
+        } catch (e: Exception) {
+            Log.e("FALL_AI", "Inference error: ${e.message}")
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // DATA SYNC
+    // ─────────────────────────────────────────────
+
+    // Periodic sync loop — pushes vitals to Firebase every 30 seconds.
+    // Fall events bypass this and push immediately via pushDataUpdates().
+    private fun startSyncLoop() {
+        serviceScope.launch {
+            while (isActive) {
+                if (isWatchOnWrist &&
+                    currentHeartRate != "--" &&
+                    currentHeartRate != "Scanning..."
+                ) {
+                    pushDataUpdates()
+                }
+                delay(30_000L)
+            }
+        }
+    }
+
+    // Single source of truth for both UI and Firebase updates.
+    private fun pushDataUpdates() {
+        val currentTimeMillis = System.currentTimeMillis()
+
+        // 1. Update the in-memory UI state
+        SharedVitals.heartRate.value = currentHeartRate
+        SharedVitals.fallDetected.value = fallDetected
+        SharedVitals.fallMessage.value = fallMessage
+
+        // 2. Push live status to Firebase (merge so we don't overwrite other fields)
+        val patientRef = db.collection("patients").document("patient_001")
+        val liveUpdates = hashMapOf<String, Any>(
+            "heartRate"     to currentHeartRate,
+            "fallDetected"  to fallDetected,
+            "statusMessage" to fallMessage,
+            "timestamp"     to currentTimeMillis
+        )
+
+        patientRef
+            .update(liveUpdates)
+            .addOnFailureListener {
+                // Document may not exist yet — create it
+                patientRef.set(liveUpdates, SetOptions.merge())
+            }
+
+        // 3. Append to history subcollection (timestamped record)
+        patientRef
+            .collection("history")
+            .document(currentTimeMillis.toString())
+            .set(liveUpdates.clone() as HashMap<String, Any>)
+    }
+
+    // ─────────────────────────────────────────────
+    // NOTIFICATION
+    // ─────────────────────────────────────────────
+
+    private fun startForegroundServiceNotification() {
+        val channelId = "VitalsServiceChannel_Silent"
+        val channel = NotificationChannel(
+            channelId,
+            "Health Monitoring",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            enableVibration(false)
+            setSound(null, null)
+        }
+        getSystemService(NotificationManager::class.java)
+            .createNotificationChannel(channel)
+
+        val notification: Notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("ElderCare Active")
+            .setContentText("Monitoring vitals and fall detection...")
+            .setSmallIcon(android.R.drawable.ic_menu_info_details)
+            .setOngoing(true)
+            .build()
+
+        startForeground(1, notification)
     }
 }
 
-// --- SHARED MEMORY OBJECT FOR THE UI ---
+// ─────────────────────────────────────────────
+// SHARED STATE (UI ↔ Service)
+// ─────────────────────────────────────────────
+
 object SharedVitals {
-    val heartRate = MutableStateFlow("--")
-    val sys = MutableStateFlow(120)
-    val dia = MutableStateFlow(80)
-    val bpStatusText = MutableStateFlow("Normal")
+    val heartRate    = MutableStateFlow("--")
     val fallDetected = MutableStateFlow(false)
-    val fallMessage = MutableStateFlow("Scanning...")
+    val fallMessage  = MutableStateFlow("Scanning...")
 }

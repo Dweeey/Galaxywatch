@@ -46,6 +46,7 @@ dependencies {
     // --- Standard Wear OS & Google Libraries ---
     implementation("com.google.android.gms:play-services-wearable:18.1.0")
     implementation("androidx.core:core-splashscreen:1.0.1")
+    implementation(files("libs/samsung-health-sensor-api-1.4.1.aar"))
 
     // --- Compose & UI (Hardcoded versions to ensure compatibility) ---
     implementation(platform("androidx.compose:compose-bom:2024.02.00"))
@@ -95,4 +96,10 @@ dependencies {
     implementation("org.tensorflow:tensorflow-lite:2.16.1")
 // Optional but highly recommended for data formatting:
     implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    implementation ("androidx.compose.ui:ui")
+    implementation ("androidx.compose.ui:ui-tooling-preview")
+    implementation ("androidx.activity:activity-compose:1.8.2")
+    implementation ("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
 }
