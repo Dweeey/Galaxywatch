@@ -51,12 +51,20 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
     // AI Variables
     private var tflite: Interpreter? = null
+    // Add these fields at the top of the class alongside other AI Variables
+    private var consecutiveHighScores = 0
+    private val CONFIRMATION_WINDOWS  = 2    // need 2 consecutive windows above threshold
+    private val FALL_THRESHOLD        = 0.5f // raised from 0.2 — reduces false alarms
+    private val VETO_THRESHOLD =  0.35f // below this = definitely not a fall
     private val sensorBuffer = FloatArray(512)
+    private val STILLNESS_VARIANCE_THRESHOLD = 0.5f
 
     // FIX: @Volatile prevents stale reads across threads
     @Volatile private var bufferIndex = 0
+    @Volatile private var isVerifying = false
+    private val POST_FALL_MOVEMENT_VETO = 3.0f
 
-    // FIX: Lock object to prevent race conditions on the buffer
+    // FIX: Lock object to prevent race conditions on the buffera
     private val bufferLock = Any()
 
     // State Variables
@@ -258,60 +266,101 @@ class BackgroundVitalsService : Service(), SensorEventListener {
     private fun runFallDetectionInference(buffer: FloatArray) {
         if (tflite == null) return
 
-        // FIX: Per-window normalization — must match training preprocessing.
-        // Training normalized each window to zero mean and unit std deviation.
+        // Guard 1: Stillness check
         val mean = buffer.average().toFloat()
-        val std = Math.sqrt(
-            buffer.map { ((it - mean) * (it - mean)).toDouble() }.average()
-        ).toFloat()
+        val variance = buffer.map { ((it - mean) * (it - mean)) }.average().toFloat()
 
+        if (variance < STILLNESS_VARIANCE_THRESHOLD) {
+            if (consecutiveHighScores > 0) consecutiveHighScores = 0
+            Log.v("FALL_AI", "Still — skipping (variance=${"%.3f".format(variance)})")
+            return
+        }
+
+        // Guard 2: Magnitude check
+        val maxMagnitude = buffer.max()
+        if (maxMagnitude < 12f) {
+            if (consecutiveHighScores > 0) consecutiveHighScores = 0
+            Log.v("FALL_AI", "Low G — skipping (max=${maxMagnitude}m/s²)")
+            return
+        }
+
+        // Normalize
+        val std = Math.sqrt(variance.toDouble()).toFloat()
         val normalizedBuffer = if (std > 0f) {
             FloatArray(512) { i -> (buffer[i] - mean) / std }
         } else {
             buffer.copyOf()
         }
 
-        // FIX: Correct input shape (1, 512, 1) — Conv1D expects 3D tensor.
-        // Using .also{} ensures each FloatArray(1) is properly initialized
-        // before being passed to the interpreter.
-        val input = Array(1) {
-            Array(512) { i ->
-                FloatArray(1).also { it[0] = normalizedBuffer[i] }
-            }
-        }
-
-        // FIX: Correct output shape (1, 1) — model outputs a single float
-        // probability between 0.0 and 1.0. Previous code used FloatArray(3)
-        // which caused index [1] to always return 0.0 (no fall detected).
+        val input = Array(1) { Array(512) { i -> FloatArray(1).also { it[0] = normalizedBuffer[i] } } }
         val output = Array(1) { FloatArray(1) }
 
         try {
             tflite?.run(input, output)
             val fallProbability = output[0][0]
 
-            Log.d("FALL_AI", "Fall probability: ${"%.3f".format(fallProbability)}")
+            Log.d("FALL_AI", "p=${"%.3f".format(fallProbability)} var=${"%.3f".format(variance)} maxG=${"%.1f".format(maxMagnitude)}")
 
-            // FIX: Threshold is 0.2 for elderly users (not 0.85).
-            // Lower threshold catches slower, lower-impact falls typical in elderly.
-            // The model was trained and validated at this threshold (86% recall).
-            if (fallProbability > 0.2f && !fallDetected) {
-                fallDetected = true
-                fallMessage = "FALL DETECTED! (${(fallProbability * 100).toInt()}%)"
+            when {
+                fallProbability > FALL_THRESHOLD -> {
+                    consecutiveHighScores++
+                    Log.d("FALL_AI", "High score $consecutiveHighScores/$CONFIRMATION_WINDOWS")
 
-                Log.w("FALL_AI", "🚨 $fallMessage")
+                    // KEY FIX: Don't alert immediately — enter a 3-second verification window.
+                    // Shaving = arm keeps moving vigorously after the "impact" → variance stays HIGH → VETO
+                    // Real fall = person is on the ground → variance drops LOW → CONFIRM
+                    if (consecutiveHighScores >= CONFIRMATION_WINDOWS && !fallDetected && !isVerifying) {
+                        isVerifying = true
+                        Log.w("FALL_AI", "⚠️ Suspected fall — verifying post-impact stillness...")
 
-                // Push emergency update immediately to Firebase + UI
-                pushDataUpdates()
+                        serviceScope.launch {
+                            delay(1500L)  // wait 1.5 seconds and sample what the wrist is doing
 
-                // Auto-reset after 10 seconds if watch still on wrist
-                serviceScope.launch {
-                    delay(10_000L)
-                    if (isWatchOnWrist) {
-                        fallDetected = false
-                        fallMessage = "Scanning..."
-                        pushDataUpdates()
+                            var recentVariance = 0f
+                            synchronized(bufferLock) {
+                                // Only grab the last 75 samples (1.5 seconds) or 150 samples (3 seconds)
+                                val samplesToLookBack = 75
+
+                                // Create a mini-list of just those recent samples
+                                val recentSamples = sensorBuffer.takeLast(samplesToLookBack)
+
+                                if (recentSamples.isNotEmpty()) {
+                                    val recentMean = recentSamples.average().toFloat()
+                                    recentVariance = recentSamples
+                                        .map { (it - recentMean) * (it - recentMean) }
+                                        .average().toFloat()
+                                }
+                            }
+
+                            if (recentVariance > POST_FALL_MOVEMENT_VETO) {
+                                // Still moving vigorously — almost certainly an ADL (shaving, gesturing, etc.)
+                                Log.d("FALL_AI", "❌ VETOED: post-impact variance=${"%.2f".format(recentVariance)} — likely ADL")
+                                consecutiveHighScores = 0
+                            } else {
+                                // Wrist went still — consistent with lying on the ground
+                                Log.w("FALL_AI", "✅ CONFIRMED: post-impact still (variance=${"%.2f".format(recentVariance)})")
+                                fallDetected = true
+                                fallMessage = "FALL DETECTED! (${(fallProbability * 100).toInt()}%)"
+                                pushDataUpdates()
+
+                                delay(10_000L)
+                                if (isWatchOnWrist) {
+                                    fallDetected = false
+                                    fallMessage = "Scanning..."
+                                    consecutiveHighScores = 0
+                                    pushDataUpdates()
+                                }
+                            }
+                            isVerifying = false
+                        }
                     }
                 }
+
+                fallProbability < VETO_THRESHOLD -> {
+                    if (!isVerifying) consecutiveHighScores = 0  // don't reset mid-verification
+                }
+
+                else -> { /* mid-zone — hold counter */ }
             }
 
         } catch (e: Exception) {

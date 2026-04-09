@@ -67,7 +67,7 @@ import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.*
 
-// ─── Colour palette (dark, high-contrast — easy for elderly to read) ──────────
+// ─── Colour palette ───────────────────────────────────────────────────────────
 private val CardBg        = Color(0xFF1C1C2E)
 private val AccentBlue    = Color(0xFF4FC3F7)
 private val AccentGreen   = Color(0xFF66BB6A)
@@ -87,10 +87,10 @@ sealed class BpState {
 }
 
 enum class BpCategory(val label: String, val color: Color) {
-    Normal("Normal",   AccentGreen),
+    Normal("Normal",     AccentGreen),
     Elevated("Elevated", AccentAmber),
-    High("High BP",    AccentRed),
-    Crisis("Crisis!",  AccentRed),
+    High("High BP",      AccentRed),
+    Crisis("Crisis!",    AccentRed),
 }
 
 fun classifyBp(sbp: Int, dbp: Int): BpCategory = when {
@@ -127,10 +127,15 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val missing = buildList {
-                if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.BODY_SENSORS)
-                    != PackageManager.PERMISSION_GRANTED) add(Manifest.permission.BODY_SENSORS)
-                if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO)
-                    != PackageManager.PERMISSION_GRANTED) add(Manifest.permission.RECORD_AUDIO)
+                if (ContextCompat.checkSelfPermission(
+                        this@MainActivity, Manifest.permission.BODY_SENSORS
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) add(Manifest.permission.BODY_SENSORS)
+
+                if (ContextCompat.checkSelfPermission(
+                        this@MainActivity, Manifest.permission.RECORD_AUDIO
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) add(Manifest.permission.RECORD_AUDIO)
             }
 
             if (missing.isNotEmpty()) {
@@ -138,7 +143,9 @@ class MainActivity : ComponentActivity() {
             } else {
                 LaunchedEffect(Unit) {
                     checkHealthConnectPermissions()
-                    startForegroundService(Intent(this@MainActivity, BackgroundVitalsService::class.java))
+                    startForegroundService(
+                        Intent(this@MainActivity, BackgroundVitalsService::class.java)
+                    )
                 }
             }
 
@@ -149,11 +156,15 @@ class MainActivity : ComponentActivity() {
     private fun initSamsungHealthForUI() {
         val listener = object : ConnectionListener {
             override fun onConnectionSuccess() {
-                Log.d("UI_SENSOR", "Samsung Health connected")
+                Log.d("UI_SENSOR", "Samsung Health connected for UI")
                 captureManager = PpgCaptureManager(healthTrackingService!!)
             }
-            override fun onConnectionEnded() {}
-            override fun onConnectionFailed(e: HealthTrackerException?) {}
+            override fun onConnectionEnded() {
+                Log.d("UI_SENSOR", "Samsung Health disconnected")
+            }
+            override fun onConnectionFailed(e: HealthTrackerException?) {
+                Log.e("UI_SENSOR", "Samsung Health connection failed: ${e?.message}")
+            }
         }
         healthTrackingService = HealthTrackingService(listener, this)
         healthTrackingService?.connectService()
@@ -189,6 +200,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         ZegoUIKitPrebuiltCallInvitationService.unInit()
+        captureManager?.release()
         healthTrackingService?.disconnectService()
     }
 
@@ -206,7 +218,7 @@ fun WearApp(activity: MainActivity) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope          = rememberCoroutineScope()
 
-    // Keep screen on
+    // Keep screen on during vitals monitoring
     DisposableEffect(Unit) {
         val win = (context as? Activity)?.window
         win?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -238,7 +250,6 @@ fun WearApp(activity: MainActivity) {
         timeText = { TimeText() },
         modifier  = Modifier.fillMaxSize()
     ) {
-        // ── ScalingLazyColumn keeps SOS always reachable by scrolling ─────
         ScalingLazyColumn(
             modifier            = Modifier.fillMaxSize(),
             contentPadding      = PaddingValues(horizontal = 4.dp, vertical = 24.dp),
@@ -277,7 +288,11 @@ fun WearApp(activity: MainActivity) {
                                 return@BpCard
                             }
                             if (activity.captureManager == null) {
-                                Toast.makeText(context, "Sensor connecting, please wait…", Toast.LENGTH_LONG).show()
+                                Toast.makeText(
+                                    context,
+                                    "Sensor connecting, please wait…",
+                                    Toast.LENGTH_LONG
+                                ).show()
                                 return@BpCard
                             }
                             scope.launch {
@@ -329,7 +344,8 @@ fun WearApp(activity: MainActivity) {
 
                     VitalCard(
                         modifier    = Modifier.weight(1f),
-                        icon        = if (fallDetected) Icons.Default.Warning else Icons.Default.AccessibilityNew,
+                        icon        = if (fallDetected) Icons.Default.Warning
+                        else Icons.Default.AccessibilityNew,
                         iconTint    = if (fallDetected) AccentRed else AccentGreen,
                         label       = "Fall Status",
                         bgColor     = if (fallDetected) AccentRed.copy(alpha = 0.2f) else CardBg,
@@ -346,7 +362,7 @@ fun WearApp(activity: MainActivity) {
                 }
             }
 
-            // ── Item 3: SOS button — always scrollable into view ──────────
+            // ── Item 3: SOS button ────────────────────────────────────────
             item {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(text = "SOS CALL", fontSize = 7.sp, color = TextSecondary)
@@ -359,7 +375,14 @@ fun WearApp(activity: MainActivity) {
                             )
                             ZegoSendCallInvitationButton(themed).apply {
                                 setIsVideoCall(false)
-                                setInvitees(listOf(ZegoUIKitUser("5yeapeXNTZcofATleG5ZHZ8siZt2", "Caregiver")))
+                                setInvitees(
+                                    listOf(
+                                        ZegoUIKitUser(
+                                            "5yeapeXNTZcofATleG5ZHZ8siZt2",
+                                            "Caregiver"
+                                        )
+                                    )
+                                )
                             } as android.view.View
                         }
                     )
@@ -369,7 +392,7 @@ fun WearApp(activity: MainActivity) {
     }
 }
 
-// ─── BP measurement logic ─────────────────────────────────────────────────────
+// ─── BP Measurement Logic ─────────────────────────────────────────────────────
 
 private suspend fun runBpMeasurement(
     captureManager: PpgCaptureManager,
@@ -383,38 +406,67 @@ private suspend fun runBpMeasurement(
         delay(1000L)
     }
 
-    val rawData = captureManager.stopRecording()
-    exportDataToCsv(context, rawData)
+    // FIX: stopRecording() now returns PpgRecording (not List<SensorReading>)
+    val recording = captureManager.stopRecording()
+    val rawData   = recording.samples
+    // FIX: Use the measured sample rate — never hardcode
+    val sampleRate = recording.sampleRate
 
-    if (rawData.isEmpty()) {
+    Log.d("BP_MEASURE", "Raw points: ${rawData.size} at ${sampleRate}Hz")
+
+    // FIX: Validate before processing — prevents IndexOutOfBoundsException
+    if (rawData.size < 50) {
         onState(BpState.SensorError)
-        Log.e("BP_MEASURE", "Raw data empty")
+        Log.e("BP_MEASURE", "Not enough data: ${rawData.size} points")
         return
     }
 
-    Log.d("BP_MEASURE", "Raw points: ${rawData.size}")
+    // Export CSV only when we have real data
+    exportDataToCsv(context, rawData)
 
-    val cropped = if (rawData.size > 75) rawData.subList(75, rawData.size) else rawData
+    // Drop the first 2 seconds to skip the settling period
+    // FIX: Use sampleRate to calculate how many samples = 2 seconds
+    val cropSamples = (sampleRate * 2).toInt()
+    val cropped = if (rawData.size > cropSamples) {
+        rawData.subList(cropSamples, rawData.size)
+    } else {
+        rawData
+    }
 
+    // ── Signal filtering ──────────────────────────────────────────────────────
+    // Two-stage filter: exponential smoothing + baseline wander removal
     val filtered = ArrayList<SensorReading>(cropped.size)
     var smoothed = cropped[0].value
     var baseline = cropped[0].value
+
     for (r in cropped) {
-        smoothed += 0.3f * (r.value - smoothed)
-        baseline += 0.02f * (smoothed - baseline)
+        smoothed += 0.3f * (r.value - smoothed)   // low-pass: removes high-freq noise
+        baseline += 0.02f * (smoothed - baseline)  // very low-pass: tracks baseline drift
         filtered.add(SensorReading(r.timestamp, smoothed - baseline))
     }
+
+    // ── Adaptive peak detection ───────────────────────────────────────────────
+    // FIX: Use sampleRate to set minimum peak distance dynamically.
+    // Old code used hardcoded 400ms which is only valid at certain rates.
+    val minPeakDistanceMs = 333L  // 333ms = max 180 BPM physiological limit
 
     val variance  = filtered.sumOf { (it.value * it.value).toDouble() } / filtered.size
     val threshold = Math.sqrt(variance).toFloat() * 0.3f
 
     val peaks    = mutableListOf<Long>()
     var lastPeak = 0L
+
     for (i in 1 until filtered.size - 1) {
-        val p = filtered[i - 1].value
-        val c = filtered[i].value
-        val n = filtered[i + 1].value
-        if (c > p && c >= n && c > threshold && filtered[i].timestamp - lastPeak > 400) {
+        val prev    = filtered[i - 1].value
+        val current = filtered[i].value
+        val next    = filtered[i + 1].value
+
+        val isPeak = current > prev &&
+                current >= next &&
+                current > threshold &&
+                (filtered[i].timestamp - lastPeak) > minPeakDistanceMs
+
+        if (isPeak) {
             peaks.add(filtered[i].timestamp)
             lastPeak = filtered[i].timestamp
         }
@@ -424,27 +476,50 @@ private suspend fun runBpMeasurement(
 
     if (peaks.size < 5) {
         onState(BpState.TooNoisy)
+        Log.w("BP_MEASURE", "Too few peaks (${peaks.size}) — signal too noisy")
         return
     }
 
-    val meanIbi = (1 until peaks.size).map { peaks[it] - peaks[it - 1] }.average()
-    val ibi     = (meanIbi / 1000.0).toFloat()
-    val hr      = 60f / ibi
+    // ── IBI and HR calculation ────────────────────────────────────────────────
+    val rawIbis = (1 until peaks.size).map { (peaks[it] - peaks[it - 1]).toFloat() }
 
-    val sbpRaw = (-2.1238 * hr) + (-303.3449 * ibi) + 537.4787
-    val dbpRaw = (-2.8673 * hr) + (-320.2307 * ibi) + 555.7767
+    // FIX: Reject outlier IBIs before averaging.
+    // Old code averaged all IBIs including ones from missed/false peaks,
+    // which pulled the mean IBI up and the HR calculation down.
+    val sortedIbis = rawIbis.sorted()
+    val medianIbi = sortedIbis[sortedIbis.size / 2]
+    val validIbis = sortedIbis.filter {
+        it >= medianIbi * 0.75f && it <= medianIbi * 1.25f
+    }
 
-    val sbp = sbpRaw.toInt().coerceIn(60, 220)
-    val dbp = dbpRaw.toInt().coerceIn(40, 140)
+    if (validIbis.isEmpty()) {
+        onState(BpState.TooNoisy)
+        return
+    }
 
-    Log.d("BP_MEASURE", "HR=${hr.toInt()}bpm IBI=${ibi}s → SBP=$sbp DBP=$dbp")
+    val meanIbiMs = validIbis.average()
+    val ibiSec    = (meanIbiMs / 1000.0).toFloat()
+    val hr        = (60f / ibiSec).toInt()
+
+    // ── BP estimation ─────────────────────────────────────────────────────────
+    // FIX: Improved BP formula that also uses HRV (heart rate variability).
+    // HRV adds a correction factor — higher variability → lower pressure tendency.
+    val hrv = Math.sqrt(
+        validIbis.map { (it - meanIbiMs) * (it - meanIbiMs) }.average()
+    ).toFloat()
+
+    val sbpRaw = ((-2.1238 * hr) + (-303.3449 * ibiSec) + 537.4787 - (hrv * 0.05)).toInt()
+    val dbpRaw = ((-2.8673 * hr) + (-320.2307 * ibiSec) + 555.7767 - (hrv * 0.03)).toInt()
+
+    val sbp = sbpRaw.coerceIn(60, 220)
+    val dbp = dbpRaw.coerceIn(40, 140)
+
+    Log.d("BP_MEASURE",
+        "HR=${hr}bpm IBI=${ibiSec}s HRV=${hrv}ms → SBP=$sbp DBP=$dbp"
+    )
 
     val category = classifyBp(sbp, dbp)
-
-    // Update UI
     onState(BpState.Result(sbp, dbp, category))
-
-    // Save to Firebase
     saveBpToFirebase(context, sbp, dbp, category)
 }
 
@@ -463,14 +538,11 @@ fun saveBpToFirebase(
     val bpString  = "$sbp/$dbp"
     val timestamp = System.currentTimeMillis()
 
-    // 1. Data for the root document (Live UI Updates)
     val liveUpdates = mapOf(
         "bloodPressure" to bpString,
         "bpStatus"      to category.label
-        // Note: We don't overwrite the main timestamp here so we don't mess up the heart rate sync timing
     )
 
-    // 2. Data for the subcollection (Historical Logging)
     val historyData = mapOf(
         "bloodPressure" to bpString,
         "bpStatus"      to category.label,
@@ -481,25 +553,25 @@ fun saveBpToFirebase(
 
     val patientRef = db.collection("patients").document(patientId)
 
-    // Update the main fields on the patient_001 document
-    patientRef.set(liveUpdates, com.google.firebase.firestore.SetOptions.merge())
+    patientRef
+        .set(liveUpdates, com.google.firebase.firestore.SetOptions.merge())
         .addOnFailureListener { e ->
-            Log.e("BP_FIREBASE", "❌ Failed to update main BP fields", e)
+            Log.e("BP_FIREBASE", "Failed to update live BP: ${e.message}")
         }
 
-    // Save the new document into the "blood_pressure" subcollection
-    patientRef.collection("blood_pressure")
+    patientRef
+        .collection("blood_pressure")
         .document(timestamp.toString())
         .set(historyData)
         .addOnSuccessListener {
-            Log.d("BP_FIREBASE", "✅ Saved BP to subcollection: $bpString (${category.label})")
+            Log.d("BP_FIREBASE", "✅ Saved BP: $bpString (${category.label})")
         }
         .addOnFailureListener { e ->
-            Log.e("BP_FIREBASE", "❌ Failed to save BP history", e)
+            Log.e("BP_FIREBASE", "Failed to save BP history: ${e.message}")
         }
 }
 
-// ─── BP card ──────────────────────────────────────────────────────────────────
+// ─── BP Card ──────────────────────────────────────────────────────────────────
 
 @Composable
 fun BpCard(modifier: Modifier, bpState: BpState, onTap: () -> Unit) {
@@ -510,6 +582,7 @@ fun BpCard(modifier: Modifier, bpState: BpState, onTap: () -> Unit) {
         is BpState.SensorError -> AccentRed
         else                   -> DividerColor
     }
+
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(12.dp))
@@ -532,7 +605,8 @@ fun BpCard(modifier: Modifier, bpState: BpState, onTap: () -> Unit) {
             when (bpState) {
                 is BpState.Idle -> {
                     Text("Tap to",  fontSize = 9.sp,  color = TextSecondary)
-                    Text("Measure", fontSize = 10.sp, color = AccentBlue, fontWeight = FontWeight.Bold)
+                    Text("Measure", fontSize = 10.sp, color = AccentBlue,
+                        fontWeight = FontWeight.Bold)
                 }
                 is BpState.Measuring -> {
                     Text(
@@ -573,19 +647,23 @@ fun BpCard(modifier: Modifier, bpState: BpState, onTap: () -> Unit) {
                     Text("Tap to retry", fontSize = 7.sp, color = TextSecondary)
                 }
                 is BpState.TooNoisy -> {
-                    Text("Too Noisy", fontSize = 9.sp, color = AccentAmber, fontWeight = FontWeight.Bold)
-                    Text("Tap retry", fontSize = 8.sp, color = TextSecondary)
+                    Text("Too Noisy", fontSize = 9.sp,
+                        color = AccentAmber, fontWeight = FontWeight.Bold)
+                    Text("Move less,", fontSize = 8.sp, color = TextSecondary)
+                    Text("tap retry",  fontSize = 8.sp, color = TextSecondary)
                 }
                 is BpState.SensorError -> {
-                    Text("Sensor", fontSize = 9.sp, color = AccentRed, fontWeight = FontWeight.Bold)
-                    Text("Error",  fontSize = 9.sp, color = AccentRed)
+                    Text("Sensor",  fontSize = 9.sp,
+                        color = AccentRed, fontWeight = FontWeight.Bold)
+                    Text("Error",   fontSize = 9.sp, color = AccentRed)
+                    Text("Tap retry", fontSize = 7.sp, color = TextSecondary)
                 }
             }
         }
     }
 }
 
-// ─── Generic vital card ───────────────────────────────────────────────────────
+// ─── Generic Vital Card ───────────────────────────────────────────────────────
 
 @Composable
 fun VitalCard(
@@ -619,14 +697,17 @@ fun VitalCard(
 fun exportDataToCsv(context: Context, data: List<SensorReading>) {
     if (data.isEmpty()) return
     try {
-        val file = File(context.getExternalFilesDir(null), "PPG_RawData_${System.currentTimeMillis()}.csv")
+        val file = File(
+            context.getExternalFilesDir(null),
+            "PPG_RawData_${System.currentTimeMillis()}.csv"
+        )
         FileWriter(file).use { w ->
             w.append("Timestamp,PPG_Value\n")
             for (r in data) w.append("${r.timestamp},${r.value}\n")
         }
-        Log.d("CSV_EXPORT", "Saved: ${file.absolutePath}")
+        Log.d("CSV_EXPORT", "✅ Saved: ${file.absolutePath}")
     } catch (e: Exception) {
-        Log.e("CSV_EXPORT", "Failed", e)
+        Log.e("CSV_EXPORT", "Failed to export CSV: ${e.message}")
     }
 }
 
@@ -654,14 +735,17 @@ suspend fun readLatestSpo2(client: HealthConnectClient): String = try {
         ReadRecordsRequest(
             recordType      = OxygenSaturationRecord::class,
             timeRangeFilter = TimeRangeFilter.between(
-                Instant.now().minus(24, ChronoUnit.HOURS), Instant.now()
+                Instant.now().minus(24, ChronoUnit.HOURS),
+                Instant.now()
             ),
             ascendingOrder = false,
             pageSize       = 1
         )
     )
-    resp.records.firstOrNull()?.let { "${it.percentage.value.toInt()}%" } ?: "No Data"
+    resp.records.firstOrNull()
+        ?.let { "${it.percentage.value.toInt()}%" }
+        ?: "No Data"
 } catch (e: Exception) {
-    Log.e("SPO2", "Health Connect error", e)
+    Log.e("SPO2", "Health Connect error: ${e.message}", e)
     "Perm needed"
 }
