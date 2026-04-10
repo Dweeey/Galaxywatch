@@ -37,6 +37,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.core.content.ContextCompat
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.records.OxygenSaturationRecord
@@ -211,14 +213,12 @@ class MainActivity : ComponentActivity() {
 }
 
 // ─── Root UI ──────────────────────────────────────────────────────────────────
-
 @Composable
 fun WearApp(activity: MainActivity) {
     val context        = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope          = rememberCoroutineScope()
 
-    // Keep screen on during vitals monitoring
     DisposableEffect(Unit) {
         val win = (context as? Activity)?.window
         win?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -248,45 +248,58 @@ fun WearApp(activity: MainActivity) {
 
     Scaffold(
         timeText = { TimeText() },
-        modifier  = Modifier.fillMaxSize()
+        modifier = Modifier.fillMaxSize()
     ) {
-        ScalingLazyColumn(
-            modifier            = Modifier.fillMaxSize(),
-            contentPadding      = PaddingValues(horizontal = 4.dp, vertical = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            state               = rememberScalingLazyListState()
-        ) {
+        Box(modifier = Modifier.fillMaxSize()) {
 
-            // ── Item 1: Heart Rate | Blood Pressure ───────────────────────
-            item {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(
+                        start = 4.dp,
+                        end = 4.dp,
+                        top = 24.dp,
+                        bottom = 72.dp
+                    ),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
                 Row(
-                    modifier              = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     VitalCard(
                         modifier = Modifier.weight(1f),
-                        icon     = Icons.Default.Favorite,
+                        icon = Icons.Default.Favorite,
                         iconTint = AccentRed,
-                        label    = "Heart Rate"
+                        label = "Heart Rate"
                     ) {
                         Text(
-                            text       = heartRate,
-                            fontSize   = 20.sp,
+                            text = heartRate,
+                            fontSize = 20.sp,
                             fontWeight = FontWeight.Bold,
-                            color      = TextPrimary
+                            color = TextPrimary
                         )
-                        Text(text = "bpm", fontSize = 9.sp, color = TextSecondary)
+                        Text(
+                            text = "bpm",
+                            fontSize = 9.sp,
+                            color = TextSecondary
+                        )
                     }
 
                     BpCard(
                         modifier = Modifier.weight(1f),
-                        bpState  = bpState,
-                        onTap    = {
+                        bpState = bpState,
+                        onTap = {
                             if (bpState is BpState.Measuring) {
-                                Toast.makeText(context, "Already measuring…", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(
+                                    context,
+                                    "Already measuring…",
+                                    Toast.LENGTH_SHORT
+                                ).show()
                                 return@BpCard
                             }
+
                             if (activity.captureManager == null) {
                                 Toast.makeText(
                                     context,
@@ -295,35 +308,33 @@ fun WearApp(activity: MainActivity) {
                                 ).show()
                                 return@BpCard
                             }
+
                             scope.launch {
                                 runBpMeasurement(
                                     captureManager = activity.captureManager!!,
-                                    context        = context,
-                                    onState        = { bpState = it }
+                                    context = context,
+                                    onState = { bpState = it }
                                 )
                             }
                         }
                     )
                 }
-            }
 
-            // ── Item 2: SpO2 | Fall Detection ─────────────────────────────
-            item {
                 Row(
-                    modifier              = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     VitalCard(
                         modifier = Modifier.weight(1f),
-                        icon     = Icons.Default.Favorite,
+                        icon = Icons.Default.Favorite,
                         iconTint = AccentBlue,
-                        label    = "SpO2"
+                        label = "SpO2"
                     ) {
                         Text(
-                            text       = spo2,
-                            fontSize   = 18.sp,
+                            text = spo2,
+                            fontSize = 18.sp,
                             fontWeight = FontWeight.Bold,
-                            color      = TextPrimary
+                            color = TextPrimary
                         )
                         Spacer(Modifier.height(3.dp))
                         Box(
@@ -334,59 +345,65 @@ fun WearApp(activity: MainActivity) {
                                 .padding(horizontal = 6.dp, vertical = 2.dp)
                         ) {
                             Text(
-                                text       = "OPEN",
-                                fontSize   = 7.sp,
-                                color      = AccentBlue,
+                                text = "OPEN",
+                                fontSize = 7.sp,
+                                color = AccentBlue,
                                 fontWeight = FontWeight.Bold
                             )
                         }
                     }
 
                     VitalCard(
-                        modifier    = Modifier.weight(1f),
-                        icon        = if (fallDetected) Icons.Default.Warning
-                        else Icons.Default.AccessibilityNew,
-                        iconTint    = if (fallDetected) AccentRed else AccentGreen,
-                        label       = "Fall Status",
-                        bgColor     = if (fallDetected) AccentRed.copy(alpha = 0.2f) else CardBg,
+                        modifier = Modifier.weight(1f),
+                        icon = if (fallDetected) Icons.Default.Warning else Icons.Default.AccessibilityNew,
+                        iconTint = if (fallDetected) AccentRed else AccentGreen,
+                        label = "Fall Status",
+                        bgColor = if (fallDetected) AccentRed.copy(alpha = 0.2f) else CardBg,
                         borderColor = if (fallDetected) AccentRed else DividerColor
                     ) {
                         Text(
-                            text       = fallMessage,
-                            fontSize   = 10.sp,
+                            text = fallMessage,
+                            fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
-                            color      = if (fallDetected) AccentRed else AccentGreen,
-                            textAlign  = TextAlign.Center
+                            color = if (fallDetected) AccentRed else AccentGreen,
+                            textAlign = TextAlign.Center
                         )
                     }
                 }
             }
 
-            // ── Item 3: SOS button ────────────────────────────────────────
-            item {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(text = "SOS CALL", fontSize = 7.sp, color = TextSecondary)
-                    Spacer(Modifier.height(2.dp))
-                    AndroidView(
-                        modifier = Modifier.size(40.dp),
-                        factory  = { ctx ->
-                            val themed = ContextThemeWrapper(
-                                ctx, android.R.style.Theme_DeviceDefault_NoActionBar
-                            )
-                            ZegoSendCallInvitationButton(themed).apply {
-                                setIsVideoCall(false)
-                                setInvitees(
-                                    listOf(
-                                        ZegoUIKitUser(
-                                            "5yeapeXNTZcofATleG5ZHZ8siZt2",
-                                            "Caregiver"
-                                        )
+            Column(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = "SOS CALL",
+                    fontSize = 7.sp,
+                    color = TextSecondary
+                )
+                Spacer(Modifier.height(2.dp))
+                AndroidView(
+                    modifier = Modifier.size(40.dp),
+                    factory = { ctx ->
+                        val themed = ContextThemeWrapper(
+                            ctx,
+                            android.R.style.Theme_DeviceDefault_NoActionBar
+                        )
+                        ZegoSendCallInvitationButton(themed).apply {
+                            setIsVideoCall(false)
+                            setInvitees(
+                                listOf(
+                                    ZegoUIKitUser(
+                                        "5yeapeXNTZcofATleG5ZHZ8siZt2",
+                                        "Caregiver"
                                     )
                                 )
-                            } as android.view.View
-                        }
-                    )
-                }
+                            )
+                        } as android.view.View
+                    }
+                )
             }
         }
     }
@@ -508,8 +525,8 @@ private suspend fun runBpMeasurement(
         validIbis.map { (it - meanIbiMs) * (it - meanIbiMs) }.average()
     ).toFloat()
 
-    val sbpRaw = ((-2.1238 * hr) + (-303.3449 * ibiSec) + 537.4787 - (hrv * 0.05)).toInt()
-    val dbpRaw = ((-2.8673 * hr) + (-320.2307 * ibiSec) + 555.7767 - (hrv * 0.03)).toInt()
+    val sbpRaw = ((-1.9333 * hr) + (-273.5684* ibiSec) + 497.1021 - (hrv * 0.05)).toInt()
+    val dbpRaw = ((-1.5688  * hr) + (-176.4811  * ibiSec) + 341.2735 - (hrv * 0.03)).toInt()
 
     val sbp = sbpRaw.coerceIn(60, 220)
     val dbp = dbpRaw.coerceIn(40, 140)

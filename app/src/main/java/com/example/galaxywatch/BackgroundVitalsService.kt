@@ -19,6 +19,8 @@ import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
+import android.app.AlertDialog
+import android.content.DialogInterface
 
 // Samsung Privileged Health SDK Imports
 import com.samsung.android.service.health.tracking.ConnectionListener
@@ -51,20 +53,16 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
     // AI Variables
     private var tflite: Interpreter? = null
-    // Add these fields at the top of the class alongside other AI Variables
     private var consecutiveHighScores = 0
-    private val CONFIRMATION_WINDOWS  = 2    // need 2 consecutive windows above threshold
-    private val FALL_THRESHOLD        = 0.5f // raised from 0.2 — reduces false alarms
-    private val VETO_THRESHOLD =  0.35f // below this = definitely not a fall
+    private val CONFIRMATION_WINDOWS  = 2
+    private val FALL_THRESHOLD        = 0.45f
+    private val VETO_THRESHOLD =  0.30f
+    private val STILLNESS_VARIANCE_THRESHOLD = 0.3f
     private val sensorBuffer = FloatArray(512)
-    private val STILLNESS_VARIANCE_THRESHOLD = 0.5f
-
-    // FIX: @Volatile prevents stale reads across threads
-    @Volatile private var bufferIndex = 0
-    @Volatile private var isVerifying = false
     private val POST_FALL_MOVEMENT_VETO = 3.0f
 
-    // FIX: Lock object to prevent race conditions on the buffera
+    @Volatile private var bufferIndex = 0
+    @Volatile private var isVerifying = false
     private val bufferLock = Any()
 
     // State Variables
@@ -72,10 +70,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
     private var fallDetected = false
     private var fallMessage = "Scanning..."
     private var isWatchOnWrist = true
-
-    // ─────────────────────────────────────────────
-    // LIFECYCLE
-    // ─────────────────────────────────────────────
+    private var fallTimerJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -91,9 +86,6 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         loadLocalAIBrain()
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-
-        // FIX: Use 20000 microseconds = 50Hz to match training data sampling rate.
-        // SENSOR_DELAY_GAME runs at ~200Hz which mismatches the model's expected input.
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         accelerometer?.let {
             sensorManager.registerListener(this, it, 20000)
@@ -104,11 +96,9 @@ class BackgroundVitalsService : Service(), SensorEventListener {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
         }
 
-        // Boot up the Samsung Health SDK
         healthTrackingService = HealthTrackingService(samsungConnectionListener, this)
         healthTrackingService?.connectService()
 
-        // Start the throttled Firebase sync loop
         startSyncLoop()
     }
 
@@ -123,10 +113,6 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         tflite?.close()
         wakeLock?.release()
     }
-
-    // ─────────────────────────────────────────────
-    // SAMSUNG HEALTH SDK
-    // ─────────────────────────────────────────────
 
     private val samsungConnectionListener = object : ConnectionListener {
         override fun onConnectionSuccess() {
@@ -169,10 +155,6 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         override fun onError(e: HealthTracker.TrackerError?) {}
     }
 
-    // ─────────────────────────────────────────────
-    // AI BRAIN LOADER
-    // ─────────────────────────────────────────────
-
     private fun loadLocalAIBrain() {
         try {
             val fileDescriptor = assets.openFd("wedafall_brain.tflite")
@@ -193,43 +175,25 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         }
     }
 
-    // ─────────────────────────────────────────────
-    // SENSOR EVENTS
-    // ─────────────────────────────────────────────
-
     override fun onSensorChanged(event: SensorEvent?) {
-
-        // ── Accelerometer → Fall Detection ──
         if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER && isWatchOnWrist) {
             val ax = event.values[0]
             val ay = event.values[1]
             val az = event.values[2]
 
-            // FIX: Compute magnitude — matches training preprocessing exactly.
-            // Training used sqrt(ax²+ay²+az²), NOT raw XYZ channels.
-            val magnitude = Math.sqrt(
-                (ax * ax + ay * ay + az * az).toDouble()
-            ).toFloat()
+            val magnitude = Math.sqrt((ax * ax + ay * ay + az * az).toDouble()).toFloat()
 
-            // FIX: synchronized block prevents buffer corruption from
-            // simultaneous reads/writes across the sensor and IO threads.
             synchronized(bufferLock) {
                 if (bufferIndex < 512) {
                     sensorBuffer[bufferIndex++] = magnitude
                 }
 
                 if (bufferIndex >= 512) {
-                    // Snapshot the buffer for inference (fast, stays on sensor thread)
                     val snapshot = sensorBuffer.copyOf()
 
-                    // FIX: Sliding window — keep last 256 samples (50% overlap).
-                    // This means inference runs every 256 new samples instead of
-                    // every 512, so falls near window boundaries are never missed.
                     System.arraycopy(sensorBuffer, 256, sensorBuffer, 0, 256)
                     bufferIndex = 256
 
-                    // FIX: Run inference on IO thread, NOT the sensor/UI thread.
-                    // Inference takes ~10–50ms and would cause ANR crashes on main thread.
                     serviceScope.launch {
                         runFallDetectionInference(snapshot)
                     }
@@ -237,21 +201,14 @@ class BackgroundVitalsService : Service(), SensorEventListener {
             }
         }
 
-        // ── Off-Body Sensor → Wrist Detection ──
         if (event?.sensor?.type == Sensor.TYPE_LOW_LATENCY_OFFBODY_DETECT) {
             val currentlyOnBody = event.values[0] != 0f
             if (isWatchOnWrist != currentlyOnBody) {
                 isWatchOnWrist = currentlyOnBody
-
                 if (!isWatchOnWrist) {
-                    // Watch removed — clear stale data
                     currentHeartRate = "--"
-                    // FIX: Reset buffer so old movement data doesn't
-                    // contaminate the next session when watch is put back on.
                     synchronized(bufferLock) { bufferIndex = 0 }
                 }
-
-                // Push wrist state change immediately
                 pushDataUpdates()
             }
         }
@@ -259,14 +216,9 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-    // ─────────────────────────────────────────────
-    // FALL DETECTION INFERENCE
-    // ─────────────────────────────────────────────
-
     private fun runFallDetectionInference(buffer: FloatArray) {
         if (tflite == null) return
 
-        // Guard 1: Stillness check
         val mean = buffer.average().toFloat()
         val variance = buffer.map { ((it - mean) * (it - mean)) }.average().toFloat()
 
@@ -276,15 +228,13 @@ class BackgroundVitalsService : Service(), SensorEventListener {
             return
         }
 
-        // Guard 2: Magnitude check
         val maxMagnitude = buffer.max()
-        if (maxMagnitude < 12f) {
+        if (maxMagnitude < 10f) {
             if (consecutiveHighScores > 0) consecutiveHighScores = 0
             Log.v("FALL_AI", "Low G — skipping (max=${maxMagnitude}m/s²)")
             return
         }
 
-        // Normalize
         val std = Math.sqrt(variance.toDouble()).toFloat()
         val normalizedBuffer = if (std > 0f) {
             FloatArray(512) { i -> (buffer[i] - mean) / std }
@@ -306,23 +256,16 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                     consecutiveHighScores++
                     Log.d("FALL_AI", "High score $consecutiveHighScores/$CONFIRMATION_WINDOWS")
 
-                    // KEY FIX: Don't alert immediately — enter a 3-second verification window.
-                    // Shaving = arm keeps moving vigorously after the "impact" → variance stays HIGH → VETO
-                    // Real fall = person is on the ground → variance drops LOW → CONFIRM
                     if (consecutiveHighScores >= CONFIRMATION_WINDOWS && !fallDetected && !isVerifying) {
                         isVerifying = true
                         Log.w("FALL_AI", "⚠️ Suspected fall — verifying post-impact stillness...")
 
                         serviceScope.launch {
-                            delay(1500L)  // wait 1.5 seconds and sample what the wrist is doing
+                            delay(1500L)
 
                             var recentVariance = 0f
                             synchronized(bufferLock) {
-                                // Only grab the last 75 samples (1.5 seconds) or 150 samples (3 seconds)
-                                val samplesToLookBack = 75
-
-                                // Create a mini-list of just those recent samples
-                                val recentSamples = sensorBuffer.takeLast(samplesToLookBack)
+                                val recentSamples = sensorBuffer.takeLast(75)
 
                                 if (recentSamples.isNotEmpty()) {
                                     val recentMean = recentSamples.average().toFloat()
@@ -333,23 +276,16 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                             }
 
                             if (recentVariance > POST_FALL_MOVEMENT_VETO) {
-                                // Still moving vigorously — almost certainly an ADL (shaving, gesturing, etc.)
                                 Log.d("FALL_AI", "❌ VETOED: post-impact variance=${"%.2f".format(recentVariance)} — likely ADL")
                                 consecutiveHighScores = 0
                             } else {
-                                // Wrist went still — consistent with lying on the ground
                                 Log.w("FALL_AI", "✅ CONFIRMED: post-impact still (variance=${"%.2f".format(recentVariance)})")
                                 fallDetected = true
                                 fallMessage = "FALL DETECTED! (${(fallProbability * 100).toInt()}%)"
                                 pushDataUpdates()
 
-                                delay(10_000L)
-                                if (isWatchOnWrist) {
-                                    fallDetected = false
-                                    fallMessage = "Scanning..."
-                                    consecutiveHighScores = 0
-                                    pushDataUpdates()
-                                }
+                                // Start the 10-second timer and ask if the user is okay
+                                startFallConfirmationTimer()
                             }
                             isVerifying = false
                         }
@@ -357,7 +293,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                 }
 
                 fallProbability < VETO_THRESHOLD -> {
-                    if (!isVerifying) consecutiveHighScores = 0  // don't reset mid-verification
+                    if (!isVerifying) consecutiveHighScores = 0
                 }
 
                 else -> { /* mid-zone — hold counter */ }
@@ -368,12 +304,44 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         }
     }
 
-    // ─────────────────────────────────────────────
-    // DATA SYNC
-    // ─────────────────────────────────────────────
+    private fun startFallConfirmationTimer() {
+        fallTimerJob = serviceScope.launch {
+            delay(10000L)  // Wait for 10 seconds before confirming fall if no response
 
-    // Periodic sync loop — pushes vitals to Firebase every 30 seconds.
-    // Fall events bypass this and push immediately via pushDataUpdates().
+            // If no response after 10 seconds, confirm fall detection
+            if (fallDetected) {
+                Log.w("FALL_AI", "No response, automatically confirming fall.")
+                fallMessage = "Fall Detected"
+                pushDataUpdates()
+            }
+        }
+
+        // Show the "Are you okay?" popup
+        showFallConfirmationDialog()
+    }
+
+    private fun showFallConfirmationDialog() {
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Are you okay?")
+            .setMessage("We detected a fall. Are you okay?")
+            .setPositiveButton("Yes") { _, _ ->
+                // If the user responds "Yes", cancel the timer and update status
+                fallDetected = false
+                fallMessage = "Scanning..."
+                pushDataUpdates()
+                fallTimerJob?.cancel()  // Cancel the timer
+            }
+            .setNegativeButton("No") { _, _ ->
+                // If the user responds "No", confirm the fall
+                fallMessage = "Fall Detected!"
+                pushDataUpdates()
+                fallTimerJob?.cancel()  // Cancel the timer
+            }
+            .create()
+
+        dialog.show()
+    }
+
     private fun startSyncLoop() {
         serviceScope.launch {
             while (isActive) {
@@ -388,7 +356,6 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         }
     }
 
-    // Single source of truth for both UI and Firebase updates.
     private fun pushDataUpdates() {
         val currentTimeMillis = System.currentTimeMillis()
 
@@ -405,11 +372,9 @@ class BackgroundVitalsService : Service(), SensorEventListener {
             "statusMessage" to fallMessage,
             "timestamp"     to currentTimeMillis
         )
-
         patientRef
             .update(liveUpdates)
             .addOnFailureListener {
-                // Document may not exist yet — create it
                 patientRef.set(liveUpdates, SetOptions.merge())
             }
 
@@ -419,10 +384,6 @@ class BackgroundVitalsService : Service(), SensorEventListener {
             .document(currentTimeMillis.toString())
             .set(liveUpdates.clone() as HashMap<String, Any>)
     }
-
-    // ─────────────────────────────────────────────
-    // NOTIFICATION
-    // ─────────────────────────────────────────────
 
     private fun startForegroundServiceNotification() {
         val channelId = "VitalsServiceChannel_Silent"
