@@ -112,6 +112,11 @@
             android:name=".BackgroundVitalsService"
             android:exported="false"
             android:foregroundServiceType="health" />
+        <activity
+            android:name=".presentation.FallConfirmationActivity"
+            android:exported="false"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
 
     </application>
 
