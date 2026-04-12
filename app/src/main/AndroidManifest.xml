@@ -10,25 +10,25 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
     <uses-permission android:name="com.samsung.android.service.health.tracking.permission.MEASURE" />
     <uses-permission android:name="com.samsung.android.hardware.sensormanager.permission.READ_ADDITIONAL_HEALTH_DATA" />
+    <uses-permission android:name="com.samsung.android.providers.health.permission.HEALTH_DATA_WRITE" />
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_HEALTH" />
 
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-
-    <uses-permission android:name="android.permission.health.READ_OXYGEN_SATURATION"/>
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_HEALTH" />
+    <uses-permission android:name="android.permission.health.READ_OXYGEN_SATURATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="android.permission.DISABLE_KEYGUARD" />
-    <uses-permission android:name="com.samsung.android.providers.health.permission.HEALTH_DATA_WRITE"/>
 
     <uses-feature android:name="android.hardware.type.watch" />
 
@@ -43,7 +43,7 @@
         android:icon="@drawable/logo"
         android:label="ElderCare+"
         android:supportsRtl="true"
-        android:theme="@style/Theme.MaterialComponents.Light.NoActionBar" >
+        android:theme="@style/Theme.MaterialComponents.Light.NoActionBar">
 
         <uses-library
             android:name="com.google.android.wearable"
@@ -53,6 +53,7 @@
             android:name="com.google.android.wearable.standalone"
             android:value="true" />
 
+        <!-- Main app launcher -->
         <activity
             android:name=".presentation.LoginActivity"
             android:exported="true"
@@ -63,17 +64,25 @@
             </intent-filter>
         </activity>
 
+        <!-- SOS launcher for hardware button mapping -->
         <activity
-            android:name="com.example.galaxywatch.presentation.MainActivity"
+            android:name=".presentation.SosLauncherActivity"
             android:exported="true"
-            android:taskAffinity=""
-            android:theme="@style/Theme.MaterialComponents.Light.NoActionBar">
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
         </activity>
 
         <activity
-            android:name="com.example.galaxywatch.presentation.PermissionsActivity"
+            android:name=".presentation.MainActivity"
             android:exported="true"
-            android:taskAffinity=""
+            android:theme="@style/Theme.MaterialComponents.Light.NoActionBar" />
+
+        <activity
+            android:name=".presentation.PermissionsActivity"
+            android:exported="true"
             android:theme="@style/MainActivityTheme.Starting">
             <intent-filter>
                 <action android:name="androidx.health.ACTION_SHOW_PERMISSIONS_RATIONALE" />
@@ -82,19 +91,20 @@
 
         <activity
             android:name=".presentation.SosActivity"
-            android:exported="true"
-            android:label="SOS Alert"
-            android:theme="@style/Theme.MaterialComponents.Light.NoActionBar">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+            android:exported="false"
+            android:theme="@style/Theme.MaterialComponents.Light.NoActionBar" />
+
+        <activity
+            android:name=".presentation.FallConfirmationActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
 
         <activity-alias
             android:name="ViewPermissionUsageActivity"
             android:exported="true"
-            android:targetActivity="com.example.galaxywatch.presentation.MainActivity"
+            android:targetActivity=".presentation.MainActivity"
             android:permission="android.permission.START_VIEW_PERMISSION_USAGE">
             <intent-filter>
                 <action android:name="android.intent.action.VIEW_PERMISSION_USAGE" />
@@ -112,11 +122,6 @@
             android:name=".BackgroundVitalsService"
             android:exported="false"
             android:foregroundServiceType="health" />
-        <activity
-            android:name=".presentation.FallConfirmationActivity"
-            android:exported="false"
-            android:taskAffinity=""
-            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
 
     </application>
 

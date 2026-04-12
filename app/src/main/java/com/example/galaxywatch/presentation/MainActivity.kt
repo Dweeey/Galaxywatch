@@ -75,6 +75,7 @@ private val AccentBlue    = Color(0xFF4FC3F7)
 private val AccentGreen   = Color(0xFF66BB6A)
 private val AccentRed     = Color(0xFFEF5350)
 private val AccentAmber   = Color(0xFFFFCA28)
+private val AccentPurple  = Color(0xFFCE93D8)
 private val TextPrimary   = Color(0xFFFFFFFF)
 private val TextSecondary = Color(0xFFB0BEC5)
 private val DividerColor  = Color(0xFF2A2A3E)
@@ -233,8 +234,13 @@ fun WearApp(activity: MainActivity) {
     val fallDetected by SharedVitals.fallDetected.collectAsState()
     val fallMessage  by SharedVitals.fallMessage.collectAsState()
 
-    var bpState by remember { mutableStateOf<BpState>(BpState.Idle) }
-    var spo2    by remember { mutableStateOf("--") }
+    var bpState    by remember { mutableStateOf<BpState>(BpState.Idle) }
+    var spo2       by remember { mutableStateOf("--") }
+
+    // ── Gesture logging state ─────────────────────────────────────────────────
+    var isLogging        by remember { mutableStateOf(false) }
+    var loggingCountdown by remember { mutableStateOf(0) }
+    // ─────────────────────────────────────────────────────────────────────────
 
     DisposableEffect(lifecycleOwner) {
         val obs = LifecycleEventObserver { _, event ->
@@ -264,6 +270,7 @@ fun WearApp(activity: MainActivity) {
                     ),
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
+                // ── Vitals row 1: Heart Rate + Blood Pressure ─────────────────
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
@@ -320,6 +327,7 @@ fun WearApp(activity: MainActivity) {
                     )
                 }
 
+                // ── Vitals row 2: SpO2 + Fall Status ─────────────────────────
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
@@ -370,8 +378,67 @@ fun WearApp(activity: MainActivity) {
                         )
                     }
                 }
+
+                // ── Gesture Logger row ────────────────────────────────────────
+                GestureLoggerCard(
+                    isLogging = isLogging,
+                    countdown = loggingCountdown,
+                    onStartStop = {
+                        if (!isLogging) {
+                            // Start logging
+                            isLogging = true
+                            loggingCountdown = 30
+
+                            val intent = Intent(context, BackgroundVitalsService::class.java).apply {
+                                action = BackgroundVitalsService.ACTION_START_LOGGING
+                            }
+                            context.startService(intent)
+
+                            // Countdown timer — auto-stops at 0
+                            scope.launch {
+                                while (loggingCountdown > 0) {
+                                    delay(1000L)
+                                    loggingCountdown--
+                                }
+                                // Auto-stop when countdown hits zero
+                                if (isLogging) {
+                                    isLogging = false
+                                    val stopIntent = Intent(
+                                        context,
+                                        BackgroundVitalsService::class.java
+                                    ).apply {
+                                        action = BackgroundVitalsService.ACTION_STOP_LOGGING
+                                    }
+                                    context.startService(stopIntent)
+                                    Toast.makeText(
+                                        context,
+                                        "Gesture saved! Pull CSV from watch.",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }
+                            }
+                        } else {
+                            // Manual early stop
+                            isLogging = false
+                            loggingCountdown = 0
+                            val stopIntent = Intent(
+                                context,
+                                BackgroundVitalsService::class.java
+                            ).apply {
+                                action = BackgroundVitalsService.ACTION_STOP_LOGGING
+                            }
+                            context.startService(stopIntent)
+                            Toast.makeText(
+                                context,
+                                "Gesture saved! Pull CSV from watch.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                )
             }
 
+            // ── SOS Call button ───────────────────────────────────────────────
             Column(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -409,6 +476,84 @@ fun WearApp(activity: MainActivity) {
     }
 }
 
+// ─── Gesture Logger Card ──────────────────────────────────────────────────────
+
+@Composable
+fun GestureLoggerCard(
+    isLogging: Boolean,
+    countdown: Int,
+    onStartStop: () -> Unit
+) {
+    val borderColor = if (isLogging) AccentPurple else DividerColor
+    val bgColor     = if (isLogging) AccentPurple.copy(alpha = 0.15f) else CardBg
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(bgColor)
+            .border(1.dp, borderColor, RoundedCornerShape(12.dp))
+            .padding(6.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Left: label + status
+            Column {
+                Text(
+                    text = "Gesture Logger",
+                    fontSize = 8.sp,
+                    color = TextSecondary
+                )
+                if (isLogging) {
+                    Text(
+                        text = "Recording… ${countdown}s left",
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = AccentPurple
+                    )
+                    Text(
+                        text = "Do your arm swing / gesture",
+                        fontSize = 7.sp,
+                        color = TextSecondary
+                    )
+                } else {
+                    Text(
+                        text = "Tap to record gestures",
+                        fontSize = 9.sp,
+                        color = TextSecondary
+                    )
+                    Text(
+                        text = "for AI training data",
+                        fontSize = 7.sp,
+                        color = TextSecondary
+                    )
+                }
+            }
+
+            // Right: Start / Stop button
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (isLogging) AccentRed else AccentPurple)
+                    .clickable { onStartStop() }
+                    .padding(horizontal = 8.dp, vertical = 5.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = if (isLogging) "STOP" else "START",
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = TextPrimary
+                )
+            }
+        }
+    }
+}
+
 // ─── BP Measurement Logic ─────────────────────────────────────────────────────
 
 private suspend fun runBpMeasurement(
@@ -423,26 +568,20 @@ private suspend fun runBpMeasurement(
         delay(1000L)
     }
 
-    // FIX: stopRecording() now returns PpgRecording (not List<SensorReading>)
-    val recording = captureManager.stopRecording()
-    val rawData   = recording.samples
-    // FIX: Use the measured sample rate — never hardcode
+    val recording  = captureManager.stopRecording()
+    val rawData    = recording.samples
     val sampleRate = recording.sampleRate
 
     Log.d("BP_MEASURE", "Raw points: ${rawData.size} at ${sampleRate}Hz")
 
-    // FIX: Validate before processing — prevents IndexOutOfBoundsException
     if (rawData.size < 50) {
         onState(BpState.SensorError)
         Log.e("BP_MEASURE", "Not enough data: ${rawData.size} points")
         return
     }
 
-    // Export CSV only when we have real data
     exportDataToCsv(context, rawData)
 
-    // Drop the first 2 seconds to skip the settling period
-    // FIX: Use sampleRate to calculate how many samples = 2 seconds
     val cropSamples = (sampleRate * 2).toInt()
     val cropped = if (rawData.size > cropSamples) {
         rawData.subList(cropSamples, rawData.size)
@@ -450,23 +589,17 @@ private suspend fun runBpMeasurement(
         rawData
     }
 
-    // ── Signal filtering ──────────────────────────────────────────────────────
-    // Two-stage filter: exponential smoothing + baseline wander removal
     val filtered = ArrayList<SensorReading>(cropped.size)
     var smoothed = cropped[0].value
     var baseline = cropped[0].value
 
     for (r in cropped) {
-        smoothed += 0.3f * (r.value - smoothed)   // low-pass: removes high-freq noise
-        baseline += 0.02f * (smoothed - baseline)  // very low-pass: tracks baseline drift
+        smoothed += 0.3f * (r.value - smoothed)
+        baseline += 0.02f * (smoothed - baseline)
         filtered.add(SensorReading(r.timestamp, smoothed - baseline))
     }
 
-    // ── Adaptive peak detection ───────────────────────────────────────────────
-    // FIX: Use sampleRate to set minimum peak distance dynamically.
-    // Old code used hardcoded 400ms which is only valid at certain rates.
-    val minPeakDistanceMs = 333L  // 333ms = max 180 BPM physiological limit
-
+    val minPeakDistanceMs = 333L
     val variance  = filtered.sumOf { (it.value * it.value).toDouble() } / filtered.size
     val threshold = Math.sqrt(variance).toFloat() * 0.3f
 
@@ -497,15 +630,10 @@ private suspend fun runBpMeasurement(
         return
     }
 
-    // ── IBI and HR calculation ────────────────────────────────────────────────
-    val rawIbis = (1 until peaks.size).map { (peaks[it] - peaks[it - 1]).toFloat() }
-
-    // FIX: Reject outlier IBIs before averaging.
-    // Old code averaged all IBIs including ones from missed/false peaks,
-    // which pulled the mean IBI up and the HR calculation down.
+    val rawIbis    = (1 until peaks.size).map { (peaks[it] - peaks[it - 1]).toFloat() }
     val sortedIbis = rawIbis.sorted()
-    val medianIbi = sortedIbis[sortedIbis.size / 2]
-    val validIbis = sortedIbis.filter {
+    val medianIbi  = sortedIbis[sortedIbis.size / 2]
+    val validIbis  = sortedIbis.filter {
         it >= medianIbi * 0.75f && it <= medianIbi * 1.25f
     }
 
@@ -518,22 +646,17 @@ private suspend fun runBpMeasurement(
     val ibiSec    = (meanIbiMs / 1000.0).toFloat()
     val hr        = (60f / ibiSec).toInt()
 
-    // ── BP estimation ─────────────────────────────────────────────────────────
-    // FIX: Improved BP formula that also uses HRV (heart rate variability).
-    // HRV adds a correction factor — higher variability → lower pressure tendency.
     val hrv = Math.sqrt(
         validIbis.map { (it - meanIbiMs) * (it - meanIbiMs) }.average()
     ).toFloat()
 
-    val sbpRaw = ((-1.9333 * hr) + (-273.5684* ibiSec) + 497.1021 - (hrv * 0.05)).toInt()
-    val dbpRaw = ((-1.5688  * hr) + (-176.4811  * ibiSec) + 341.2735 - (hrv * 0.03)).toInt()
+    val sbpRaw = ((-1.8425 * hr) + (-263.5957 * ibiSec) + 482.2377 - (hrv * 0.05)).toInt()
+    val dbpRaw = ((-1.5673  * hr) + (-176.5570 * ibiSec) + 341.2582 - (hrv * 0.03)).toInt()
 
     val sbp = sbpRaw.coerceIn(60, 220)
     val dbp = dbpRaw.coerceIn(40, 140)
 
-    Log.d("BP_MEASURE",
-        "HR=${hr}bpm IBI=${ibiSec}s HRV=${hrv}ms → SBP=$sbp DBP=$dbp"
-    )
+    Log.d("BP_MEASURE", "HR=${hr}bpm IBI=${ibiSec}s HRV=${hrv}ms → SBP=$sbp DBP=$dbp")
 
     val category = classifyBp(sbp, dbp)
     onState(BpState.Result(sbp, dbp, category))
@@ -542,12 +665,7 @@ private suspend fun runBpMeasurement(
 
 // ─── Firebase save ────────────────────────────────────────────────────────────
 
-fun saveBpToFirebase(
-    context:  Context,
-    sbp:      Int,
-    dbp:      Int,
-    category: BpCategory
-) {
+fun saveBpToFirebase(context: Context, sbp: Int, dbp: Int, category: BpCategory) {
     val prefs     = context.getSharedPreferences("ElderCarePrefs", Context.MODE_PRIVATE)
     val patientId = prefs.getString("PATIENT_ID", "patient_001") ?: "patient_001"
     val db        = FirebaseFirestore.getInstance()

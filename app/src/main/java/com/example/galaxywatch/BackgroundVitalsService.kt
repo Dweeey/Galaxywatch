@@ -19,7 +19,6 @@ import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
-
 import com.samsung.android.service.health.tracking.ConnectionListener
 import com.samsung.android.service.health.tracking.HealthTracker
 import com.samsung.android.service.health.tracking.HealthTrackerException
@@ -27,8 +26,8 @@ import com.samsung.android.service.health.tracking.HealthTrackingService
 import com.samsung.android.service.health.tracking.data.DataPoint
 import com.samsung.android.service.health.tracking.data.HealthTrackerType
 import com.samsung.android.service.health.tracking.data.ValueKey
-
 import org.tensorflow.lite.Interpreter
+import java.io.File
 import java.io.FileInputStream
 import java.nio.channels.FileChannel
 
@@ -40,6 +39,14 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
         const val ACTION_CONFIRM_FALL = "ACTION_CONFIRM_FALL"
         const val ACTION_CANCEL_FALL = "ACTION_CANCEL_FALL"
+        const val ACTION_TRIGGER_SOS = "ACTION_TRIGGER_SOS"
+
+        // Logging actions — trigger these from your app UI
+        const val ACTION_START_LOGGING = "ACTION_START_LOGGING"
+        const val ACTION_STOP_LOGGING  = "ACTION_STOP_LOGGING"   // saves as ADL (label=0)
+
+        private const val PREFS_SYSTEM_STATE = "SYSTEM_STATE"
+        private const val KEY_SOS_ACTIVE = "SOS_ACTIVE"
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -57,16 +64,20 @@ class BackgroundVitalsService : Service(), SensorEventListener {
     private var tflite: Interpreter? = null
 
     private var consecutiveHighScores = 0
-    private val CONFIRMATION_WINDOWS = 2
+    private val CONFIRMATION_WINDOWS = 3
     private val FALL_THRESHOLD = 0.45f
-    private val VETO_THRESHOLD = 0.30f
+    private val VETO_THRESHOLD = 0.50f
     private val STILLNESS_VARIANCE_THRESHOLD = 0.3f
-    private val POST_FALL_MOVEMENT_VETO = 3.0f
+    private val POST_FALL_MOVEMENT_VETO = 1.5f
 
     private val sensorBuffer = FloatArray(512)
 
     @Volatile private var bufferIndex = 0
     @Volatile private var isVerifying = false
+    @Volatile private var ignoreFallDetection = false
+    @Volatile private var isManualSosActive = false
+
+    private var sosSuppressionJob: Job? = null
 
     private val bufferLock = Any()
 
@@ -75,9 +86,14 @@ class BackgroundVitalsService : Service(), SensorEventListener {
     private var fallMessage = "Scanning..."
     private var isWatchOnWrist = true
 
-    // Firebase throttling
     private var lastFirebaseUpdateTime = 0L
-    private val FIREBASE_UPDATE_INTERVAL = 30_000L // 30 seconds
+    private val FIREBASE_UPDATE_INTERVAL = 30_000L
+
+    // ── Gesture logging ──────────────────────────────────────────────────────
+    @Volatile private var isLoggingMode = false
+    private val loggedWindows = mutableListOf<FloatArray>()
+    private val loggingLock = Any()
+    // ─────────────────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
@@ -92,7 +108,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         accelerometer?.let {
-            sensorManager.registerListener(this, it, 20000) // 50Hz
+            sensorManager.registerListener(this, it, 20000)
         }
 
         offBodySensor = sensorManager.getDefaultSensor(Sensor.TYPE_LOW_LATENCY_OFFBODY_DETECT)
@@ -105,6 +121,26 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+
+            ACTION_START_LOGGING -> {
+                synchronized(loggingLock) { loggedWindows.clear() }
+                isLoggingMode = true
+                Log.d("GESTURE_LOG", "Logging started — perform your gestures now")
+                return START_STICKY
+            }
+
+            ACTION_STOP_LOGGING -> {
+                isLoggingMode = false
+                saveLoggedData(label = 0)   // 0 = ADL / not a fall
+                Log.d("GESTURE_LOG", "Logging stopped and saved")
+                return START_STICKY
+            }
+
+            ACTION_TRIGGER_SOS -> {
+                startManualSosSuppression()
+                return START_STICKY
+            }
+
             ACTION_CANCEL_FALL -> {
                 Log.d("FALL_AI", "User cancelled fall alert")
 
@@ -129,10 +165,8 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                 SharedVitals.fallDetected.value = true
                 SharedVitals.fallMessage.value = fallMessage
 
-                // Push confirmed fall immediately
                 pushDataUpdates(forceFirebase = true)
 
-                // Reset after 1 minute so Firebase does not stay true forever
                 serviceScope.launch {
                     delay(60_000L)
 
@@ -184,7 +218,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
     private fun connectSamsungHealth() {
         val listener = object : ConnectionListener {
             override fun onConnectionSuccess() {
-                Log.d("SAMSUNG_SDK", "✅ Connected to Samsung Health Platform!")
+                Log.d("SAMSUNG_SDK", "Connected to Samsung Health Platform")
                 try {
                     hrTracker = healthTrackingService?.getHealthTracker(
                         HealthTrackerType.HEART_RATE_CONTINUOUS
@@ -196,11 +230,11 @@ class BackgroundVitalsService : Service(), SensorEventListener {
             }
 
             override fun onConnectionEnded() {
-                Log.w("SAMSUNG_SDK", "Disconnected from Health Platform.")
+                Log.w("SAMSUNG_SDK", "Disconnected from Health Platform")
             }
 
             override fun onConnectionFailed(e: HealthTrackerException?) {
-                Log.e("SAMSUNG_SDK", "Connection Failed: ${e?.message}")
+                Log.e("SAMSUNG_SDK", "Connection failed: ${e?.message}")
             }
         }
 
@@ -217,13 +251,8 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                     val hr = data.getValue(ValueKey.HeartRateSet.HEART_RATE) as? Int ?: continue
                     if (hr > 0) {
                         currentHeartRate = hr.toString()
-
-                        // Instant watch UI update
                         SharedVitals.heartRate.value = currentHeartRate
-
-                        // Throttled Firebase update
                         pushDataUpdates(forceFirebase = false)
-
                         Log.d("HR_DEBUG", "Heart rate updated locally: $currentHeartRate")
                     }
                 } catch (e: Exception) {
@@ -233,7 +262,6 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         }
 
         override fun onFlushCompleted() {}
-
         override fun onError(e: HealthTracker.TrackerError?) {
             Log.e("HR_DEBUG", "Tracker error: $e")
         }
@@ -255,9 +283,9 @@ class BackgroundVitalsService : Service(), SensorEventListener {
             }
 
             tflite = Interpreter(mappedBuffer, options)
-            Log.d("FALL_AI", "✅ Brain loaded successfully")
+            Log.d("FALL_AI", "Brain loaded successfully")
         } catch (e: Exception) {
-            Log.e("FALL_AI", "❌ Failed to load brain: ${e.message}", e)
+            Log.e("FALL_AI", "Failed to load brain: ${e.message}", e)
         }
     }
 
@@ -280,6 +308,15 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                     bufferIndex = 256
 
                     serviceScope.launch {
+                        // If logging mode is on, capture the buffer and skip inference
+                        if (isLoggingMode) {
+                            synchronized(loggingLock) {
+                                loggedWindows.add(snapshot)
+                            }
+                            Log.v("GESTURE_LOG", "Captured window #${loggedWindows.size}")
+                            return@launch
+                        }
+
                         runFallDetectionInference(snapshot)
                     }
                 }
@@ -304,8 +341,60 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
+    // ── Gesture logger ───────────────────────────────────────────────────────
+    /**
+     * Saves all captured windows to a CSV file in the app's external files dir.
+     * Pull from the watch with:
+     *   adb pull /sdcard/Android/data/com.example.galaxywatch/files/ ./watch_data/
+     *
+     * @param label  0 = ADL (normal movement), 1 = Fall
+     */
+    private fun saveLoggedData(label: Int) {
+        val windows: List<FloatArray>
+        synchronized(loggingLock) {
+            windows = loggedWindows.toList()
+            loggedWindows.clear()
+        }
+
+        if (windows.isEmpty()) {
+            Log.w("GESTURE_LOG", "No windows captured — nothing to save")
+            return
+        }
+
+        serviceScope.launch {
+            try {
+                val filename = "gesture_log_label${label}_${System.currentTimeMillis()}.csv"
+                val file = File(getExternalFilesDir(null), filename)
+
+                file.bufferedWriter().use { writer ->
+                    // Header: label, t0, t1, ..., t511
+                    val header = "label," + (0 until 512).joinToString(",") { "t$it" }
+                    writer.write(header)
+                    writer.newLine()
+
+                    for (window in windows) {
+                        val row = "$label," + window.joinToString(",")
+                        writer.write(row)
+                        writer.newLine()
+                    }
+                }
+
+                Log.d("GESTURE_LOG", "Saved ${windows.size} windows → ${file.absolutePath}")
+
+            } catch (e: Exception) {
+                Log.e("GESTURE_LOG", "Failed to save log: ${e.message}", e)
+            }
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     private fun runFallDetectionInference(buffer: FloatArray) {
         if (tflite == null) return
+
+        if (ignoreFallDetection || isManualSosActive || isSosActiveFromPrefs()) {
+            Log.d("FALL_AI", "Ignored because manual SOS is active")
+            return
+        }
 
         val mean = buffer.average().toFloat()
         val variance = buffer.map { ((it - mean) * (it - mean)) }.average().toFloat()
@@ -349,7 +438,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
                     if (consecutiveHighScores >= CONFIRMATION_WINDOWS && !fallDetected && !isVerifying) {
                         isVerifying = true
-                        Log.w("FALL_AI", "⚠️ Suspected fall — verifying post-impact stillness...")
+                        Log.w("FALL_AI", "Suspected fall — verifying post-impact stillness")
 
                         serviceScope.launch {
                             delay(1500L)
@@ -357,7 +446,6 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                             var recentVariance = 0f
                             synchronized(bufferLock) {
                                 val recentSamples = sensorBuffer.takeLast(75)
-
                                 if (recentSamples.isNotEmpty()) {
                                     val recentMean = recentSamples.average().toFloat()
                                     recentVariance = recentSamples
@@ -370,21 +458,31 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                             if (recentVariance > POST_FALL_MOVEMENT_VETO) {
                                 Log.d(
                                     "FALL_AI",
-                                    "❌ VETOED: post-impact variance=${"%.2f".format(recentVariance)} — likely ADL"
+                                    "VETOED: post-impact variance=${"%.2f".format(recentVariance)}"
                                 )
                                 consecutiveHighScores = 0
                             } else {
                                 Log.w(
                                     "FALL_AI",
-                                    "✅ CONFIRMED: post-impact still (variance=${"%.2f".format(recentVariance)})"
+                                    "CONFIRMED: post-impact still (variance=${"%.2f".format(recentVariance)})"
                                 )
+
+                                if (ignoreFallDetection || isManualSosActive || isSosActiveFromPrefs()) {
+                                    Log.d("FALL_AI", "Fall confirmation blocked because SOS is active")
+                                    fallDetected = false
+                                    fallMessage = "Scanning..."
+                                    SharedVitals.fallDetected.value = false
+                                    SharedVitals.fallMessage.value = fallMessage
+                                    pushDataUpdates(forceFirebase = true)
+                                    isVerifying = false
+                                    return@launch
+                                }
 
                                 fallDetected = true
                                 fallMessage = "Checking..."
                                 SharedVitals.fallDetected.value = true
                                 SharedVitals.fallMessage.value = fallMessage
 
-                                // Launch 10-second confirmation UI from activity
                                 launchFallConfirmationActivity()
                             }
 
@@ -398,34 +496,75 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                 }
 
                 else -> {
-                    // mid-zone — hold counter
+                    // hold counter
                 }
             }
-
         } catch (e: Exception) {
             Log.e("FALL_AI", "Inference error: ${e.message}", e)
         }
     }
 
     private fun launchFallConfirmationActivity() {
+        if (ignoreFallDetection || isManualSosActive || isSosActiveFromPrefs()) {
+            Log.d("FALL_AI", "Blocked FallConfirmationActivity launch because SOS is active")
+            return
+        }
+
         val intent = Intent(
             this,
             com.example.galaxywatch.presentation.FallConfirmationActivity::class.java
         ).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         }
         startActivity(intent)
+    }
+
+    private fun startManualSosSuppression() {
+        Log.d("SOS", "Manual SOS suppression started")
+
+        isManualSosActive = true
+        ignoreFallDetection = true
+        setSosActivePref(true)
+
+        isVerifying = false
+        consecutiveHighScores = 0
+        fallDetected = false
+        fallMessage = "Scanning..."
+
+        SharedVitals.fallDetected.value = false
+        SharedVitals.fallMessage.value = fallMessage
+
+        pushDataUpdates(forceFirebase = true)
+
+        sosSuppressionJob?.cancel()
+        sosSuppressionJob = serviceScope.launch {
+            delay(60_000L)
+            isManualSosActive = false
+            ignoreFallDetection = false
+            setSosActivePref(false)
+            Log.d("SOS", "Manual SOS suppression ended")
+        }
+    }
+
+    private fun setSosActivePref(active: Boolean) {
+        getSharedPreferences(PREFS_SYSTEM_STATE, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_SOS_ACTIVE, active)
+            .apply()
+    }
+
+    private fun isSosActiveFromPrefs(): Boolean {
+        return getSharedPreferences(PREFS_SYSTEM_STATE, Context.MODE_PRIVATE)
+            .getBoolean(KEY_SOS_ACTIVE, false)
     }
 
     private fun pushDataUpdates(forceFirebase: Boolean = false) {
         val currentTimeMillis = System.currentTimeMillis()
 
-        // Always update local UI instantly
         SharedVitals.heartRate.value = currentHeartRate
         SharedVitals.fallDetected.value = fallDetected
         SharedVitals.fallMessage.value = fallMessage
 
-        // Firebase only every 30 seconds unless forced
         if (!forceFirebase && currentTimeMillis - lastFirebaseUpdateTime < FIREBASE_UPDATE_INTERVAL) {
             return
         }
@@ -442,23 +581,15 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
         patientRef
             .set(liveUpdates, SetOptions.merge())
-            .addOnSuccessListener {
-                Log.d("FIREBASE_DEBUG", "Live data updated")
-            }
-            .addOnFailureListener {
-                Log.e("FIREBASE_DEBUG", "Failed to update live data: ${it.message}")
-            }
+            .addOnSuccessListener { Log.d("FIREBASE_DEBUG", "Live data updated") }
+            .addOnFailureListener { Log.e("FIREBASE_DEBUG", "Failed to update live data: ${it.message}") }
 
         patientRef
             .collection("history")
             .document(currentTimeMillis.toString())
             .set(HashMap(liveUpdates))
-            .addOnSuccessListener {
-                Log.d("FIREBASE_DEBUG", "History saved")
-            }
-            .addOnFailureListener {
-                Log.e("FIREBASE_DEBUG", "Failed to save history: ${it.message}")
-            }
+            .addOnSuccessListener { Log.d("FIREBASE_DEBUG", "History saved") }
+            .addOnFailureListener { Log.e("FIREBASE_DEBUG", "Failed to save history: ${it.message}") }
     }
 
     private fun startForegroundServiceNotification() {

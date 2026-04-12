@@ -1,7 +1,12 @@
 package com.example.galaxywatch.presentation
 
+import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -27,15 +32,35 @@ import kotlinx.coroutines.delay
 
 class FallConfirmationActivity : ComponentActivity() {
 
+    companion object {
+        private const val PREFS_SYSTEM_STATE = "SYSTEM_STATE"
+        private const val KEY_SOS_ACTIVE = "SOS_ACTIVE"
+    }
+
+    private var vibrator: Vibrator? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        val isSosActive = getSharedPreferences(PREFS_SYSTEM_STATE, Context.MODE_PRIVATE)
+            .getBoolean(KEY_SOS_ACTIVE, false)
+
+        if (isSosActive) {
+            Log.d("FALL_UI", "Blocked FallConfirmationActivity due to SOS")
+            finish()
+            return
+        }
+
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        triggerRepeatingVibration()
 
         setContent {
             MaterialTheme {
                 FallConfirmationScreen(
                     onImOk = {
+                        stopVibration()
                         val intent = Intent(this, BackgroundVitalsService::class.java).apply {
                             action = BackgroundVitalsService.ACTION_CANCEL_FALL
                         }
@@ -43,6 +68,7 @@ class FallConfirmationActivity : ComponentActivity() {
                         finish()
                     },
                     onTimeout = {
+                        stopVibration()
                         val intent = Intent(this, BackgroundVitalsService::class.java).apply {
                             action = BackgroundVitalsService.ACTION_CONFIRM_FALL
                         }
@@ -52,6 +78,29 @@ class FallConfirmationActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    private fun triggerRepeatingVibration() {
+        val pattern = longArrayOf(0, 700, 300, 700, 300, 700)
+
+        vibrator?.let {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val effect = VibrationEffect.createWaveform(pattern, 0)
+                it.vibrate(effect)
+            } else {
+                @Suppress("DEPRECATION")
+                it.vibrate(pattern, 0)
+            }
+        }
+    }
+
+    private fun stopVibration() {
+        vibrator?.cancel()
+    }
+
+    override fun onDestroy() {
+        stopVibration()
+        super.onDestroy()
     }
 }
 
@@ -68,6 +117,7 @@ fun FallConfirmationScreen(
             delay(1000L)
             secondsLeft--
         }
+
         if (!finished) {
             finished = true
             onTimeout()
@@ -116,10 +166,7 @@ fun FallConfirmationScreen(
                 }
             }
         ) {
-            Text(
-                text = "I'M OK",
-                color = Color.White
-            )
+            Text("I'M OK")
         }
     }
 }
