@@ -38,6 +38,7 @@ class FallConfirmationActivity : ComponentActivity() {
     }
 
     private var vibrator: Vibrator? = null
+    private var handled = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -60,19 +61,35 @@ class FallConfirmationActivity : ComponentActivity() {
             MaterialTheme {
                 FallConfirmationScreen(
                     onImOk = {
+                        if (handled) return@FallConfirmationScreen
+                        handled = true
                         stopVibration()
-                        val intent = Intent(this, BackgroundVitalsService::class.java).apply {
+
+                        // cancel the fall alert
+                        val cancelIntent = Intent(this, BackgroundVitalsService::class.java).apply {
                             action = BackgroundVitalsService.ACTION_CANCEL_FALL
                         }
-                        startService(intent)
+                        startService(cancelIntent)
                         finish()
                     },
                     onTimeout = {
+                        if (handled) return@FallConfirmationScreen
+                        handled = true
                         stopVibration()
-                        val intent = Intent(this, BackgroundVitalsService::class.java).apply {
+
+                        // first confirm the fall in the service
+                        val confirmIntent = Intent(this, BackgroundVitalsService::class.java).apply {
                             action = BackgroundVitalsService.ACTION_CONFIRM_FALL
                         }
-                        startService(intent)
+                        startService(confirmIntent)
+
+                        // then suppress fall re-triggering and launch SOS call
+                        val sosSuppressIntent = Intent(this, BackgroundVitalsService::class.java).apply {
+                            action = BackgroundVitalsService.ACTION_TRIGGER_SOS
+                        }
+                        startService(sosSuppressIntent)
+
+                        startActivity(Intent(this, SosActivity::class.java))
                         finish()
                     }
                 )
