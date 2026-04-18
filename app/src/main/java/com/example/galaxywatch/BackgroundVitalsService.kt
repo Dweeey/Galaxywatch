@@ -80,10 +80,10 @@ class BackgroundVitalsService : Service(), SensorEventListener {
     //   1 strong window is enough; the 1.5 s post-impact stillness check is the
     //   real safeguard against false positives.
     private val CONFIRMATION_WINDOWS         = 2      // FIX #2 (was 3)
-    private val FALL_THRESHOLD               = 0.60f   // FIX #5 (was 0.40)
+    private val FALL_THRESHOLD               = 0.68f   // FIX #5 (was 0.40)
     private val VETO_THRESHOLD               = 0.25f   // FIX #5 (was 0.50 — inverted logic)
     private val STILLNESS_VARIANCE_THRESHOLD = 0.3f
-    private val POST_FALL_MOVEMENT_VETO      = 0.08f
+    private val POST_FALL_MOVEMENT_VETO      = 0.10f
 
     // ── Sensor buffers ────────────────────────────────────────────────────────
     //
@@ -360,9 +360,13 @@ class BackgroundVitalsService : Service(), SensorEventListener {
             return
         }
 
-        // Quick pre-screen: skip clearly-still windows
+        // ─────────────────────────────────────────────
+        // BASIC SIGNAL STATS
+        // ─────────────────────────────────────────────
         val accelMean = accelBuf.average().toFloat()
         val accelVar  = accelBuf.map { (it - accelMean) * (it - accelMean) }.average().toFloat()
+        val maxG      = accelBuf.maxOrNull() ?: 0f
+        val maxGyro   = gyroBuf.maxOrNull() ?: 0f
 
         if (accelVar < STILLNESS_VARIANCE_THRESHOLD) {
             if (consecutiveHighScores > 0) consecutiveHighScores = 0
@@ -370,123 +374,167 @@ class BackgroundVitalsService : Service(), SensorEventListener {
             return
         }
 
-        // FIX #4: Lowered from 10f → 8.5f to catch slow/soft falls by elderly users.
-        // At rest, accel magnitude ≈ 9.8 m/s² (gravity). The original threshold of
-        // 10f sat just above resting gravity, so gentle falls that never spike high
-        // (e.g. falling onto furniture) were silently discarded before reaching the model.
-        val maxG = accelBuf.max()
-        if (maxG < 8.5f) {
+        if (maxG < 10.5f) {
             if (consecutiveHighScores > 0) consecutiveHighScores = 0
-            Log.v("FALL_AI", "Low-G — skip (max=${"%.1f".format(maxG)})")
+            Log.v("FALL_AI", "Low-G — skip (maxG=${"%.2f".format(maxG)})")
             return
         }
 
-        // Z-score normalise each channel independently (mirrors training's resample_and_normalize)
+        val highAccelCount = accelBuf.count { it > 12.5f }
+        val highGyroCount  = gyroBuf.count { it > 1.5f }
+
+        if (highAccelCount < 15) {
+            consecutiveHighScores = 0
+            Log.d("FALL_AI", "Rejected: brief accel burst (likely wrist gesture)")
+            return
+        }
+
+        if (maxG > 10.5f && maxGyro < 1.3f) {
+            consecutiveHighScores = 0
+            Log.d("FALL_AI", "Rejected: accel spike without enough rotation")
+            return
+        }
+
+        if (highGyroCount < 6) {
+            consecutiveHighScores = 0
+            Log.d("FALL_AI", "Rejected: too little gyro activity for a real fall")
+            return
+        }
+
+        // ─────────────────────────────────────────────
+        // NORMALISE CHANNELS (same as training)
+        // ─────────────────────────────────────────────
         fun normalise(buf: FloatArray): FloatArray {
-            val m   = buf.average().toFloat()
-            val std = Math.sqrt(buf.map { ((it - m) * (it - m)).toDouble() }.average()).toFloat()
+            val m = buf.average().toFloat()
+            val std = kotlin.math.sqrt(
+                buf.map { ((it - m) * (it - m)).toDouble() }.average()
+            ).toFloat()
             return if (std > 0f) FloatArray(MODEL_LEN) { i -> (buf[i] - m) / std } else buf.copyOf()
         }
 
         val normAccel = normalise(accelBuf)
         val normGyro  = normalise(gyroBuf)
 
-        // Model expects (1, 512, 2): channel 0 = accel mag, channel 1 = gyro mag
-        val input  = Array(1) { Array(MODEL_LEN) { i -> floatArrayOf(normAccel[i], normGyro[i]) } }
+        val input = Array(1) { Array(MODEL_LEN) { i ->
+            floatArrayOf(normAccel[i], normGyro[i])
+        }}
         val output = Array(1) { FloatArray(1) }
 
         try {
             tflite?.run(input, output)
             val p = output[0][0]
 
-            Log.d("FALL_AI",
-                "p=${"%.3f".format(p)} accelVar=${"%.3f".format(accelVar)} maxG=${"%.1f".format(maxG)}")
+            Log.d(
+                "FALL_AI",
+                "p=${"%.3f".format(p)} maxG=${"%.2f".format(maxG)} maxGyro=${"%.2f".format(maxGyro)} aCount=$highAccelCount gCount=$highGyroCount"
+            )
 
-            // FIX #5: Corrected threshold semantics.
-            //   p > FALL_THRESHOLD (0.45)  → confident fall signal  → increment counter
-            //   p < VETO_THRESHOLD (0.25)  → clearly not a fall     → reset counter
-            //   0.25 ≤ p ≤ 0.45            → ambiguous zone         → hold counter
-            //
-            // Previously VETO (0.50) > FALL (0.40), which made the ambiguous branch
-            // unreachable because the first `when` branch (p > 0.40) always matched
-            // before p < 0.50 could be evaluated for values in [0.40, 0.50].
             when {
                 p > FALL_THRESHOLD -> {
                     consecutiveHighScores++
                     Log.d("FALL_AI", "Score $consecutiveHighScores/$CONFIRMATION_WINDOWS")
 
-                    // FIX #2: CONFIRMATION_WINDOWS = 1, so this fires on the first
-                    // high-confidence window instead of requiring 3 consecutive ones
-                    // (~15 seconds apart), which a brief fall event can never satisfy.
                     if (consecutiveHighScores >= CONFIRMATION_WINDOWS && !fallDetected && !isVerifying) {
                         isVerifying = true
-                        Log.w("FALL_AI", "Suspected fall — checking post-impact stillness")
+                        Log.w("FALL_AI", "Suspected fall — checking post-impact fusion stillness")
 
                         serviceScope.launch {
-                            // Wait 2500ms instead of 1500ms — gives punch arm time to finish returning
-                            // and settle, which would push variance HIGHER, not lower.
-                            // A real fall person is still on the floor the entire time.
                             delay(2500L)
 
-                            var recentVar = 0f
-                            var recentGyroMax  = 0f   // ADD: check for punch return-stroke in gyro
+                            var recentAccelVar = 0f
+                            var recentGyroMax = 0f
 
                             synchronized(bufferLock) {
-                                val end    = bufferIndex
-                                val start  = (end - 125).coerceAtLeast(0)  // 125 samples = 2.5s @ 50Hz
+                                val end   = bufferIndex
+                                val start = (end - 125).coerceAtLeast(0) // last 2.5 sec @ 50Hz
+
                                 val recentA = accelBuffer.slice(start until end)
-                                val recentG = gyroBuffer.slice(start until end)   // ADD
+                                val recentG = gyroBuffer.slice(start until end)
 
                                 if (recentA.isNotEmpty()) {
                                     val rm = recentA.average().toFloat()
-                                    recentVar = recentA.map { (it - rm) * (it - rm) }.average().toFloat()
+                                    recentAccelVar = recentA
+                                        .map { (it - rm) * (it - rm) }
+                                        .average()
+                                        .toFloat()
                                 }
+
                                 if (recentG.isNotEmpty()) {
-                                    recentGyroMax = recentG.maxOrNull() ?: 0f   // ADD
+                                    recentGyroMax = recentG.maxOrNull() ?: 0f
                                 }
                             }
-                            val isMoving    = recentVar > POST_FALL_MOVEMENT_VETO   // now 0.08f
-                            val hasReturnStroke = recentGyroMax > 1.5f
 
-                            if (recentVar > POST_FALL_MOVEMENT_VETO) {
-                                Log.d("FALL_AI", "VETOED: post-impact var=${"%.2f".format(recentVar)}")
+                            val stillAfterImpact = recentAccelVar <= POST_FALL_MOVEMENT_VETO
+                            val lowRotationAfterImpact = recentGyroMax < 1.2f
+
+                            // ─────────────────────────────────────────────
+                            // NEW RULE 2: JUMP / RISKY MOVEMENT
+                            // strong impact + strong rotation + continues moving
+                            // ─────────────────────────────────────────────
+                            if (!stillAfterImpact && recentGyroMax > 1.8f && maxG > 14f) {
+                                Log.w(
+                                    "FALL_AI",
+                                    "RISKY MOVEMENT: jump-like / forceful landing (recentVar=${"%.2f".format(recentAccelVar)}, recentGyro=${"%.2f".format(recentGyroMax)})"
+                                )
+                                fallDetected = false
+                                fallMessage = "Risky Movement!"
+                                SharedVitals.fallDetected.value = false
+                                SharedVitals.fallMessage.value = fallMessage
+                                pushDataUpdates(forceFirebase = true)
+                                consecutiveHighScores = 0
+                                isVerifying = false
+                                return@launch
+                            }
+
+                            // ─────────────────────────────────────────────
+                            // NORMAL FALL VETO
+                            // ─────────────────────────────────────────────
+                            if (!stillAfterImpact || !lowRotationAfterImpact) {
+                                Log.d(
+                                    "FALL_AI",
+                                    "VETOED: continued motion after impact (var=${"%.2f".format(recentAccelVar)}, gyro=${"%.2f".format(recentGyroMax)})"
+                                )
                                 consecutiveHighScores = 0
                             } else {
-                                Log.w("FALL_AI", "CONFIRMED: still after impact (var=${"%.2f".format(recentVar)})")
+                                Log.w(
+                                    "FALL_AI",
+                                    "CONFIRMED: still after impact (var=${"%.2f".format(recentAccelVar)}, gyro=${"%.2f".format(recentGyroMax)})"
+                                )
 
                                 if (ignoreFallDetection || isManualSosActive || isSosActiveFromPrefs()) {
                                     fallDetected = false
-                                    fallMessage  = "Scanning..."
+                                    fallMessage = "Scanning..."
                                     SharedVitals.fallDetected.value = false
-                                    SharedVitals.fallMessage.value  = fallMessage
+                                    SharedVitals.fallMessage.value = fallMessage
                                     pushDataUpdates(forceFirebase = true)
                                     isVerifying = false
                                     return@launch
                                 }
 
                                 fallDetected = true
-                                fallMessage  = "Checking..."
+                                fallMessage = "Checking..."
                                 SharedVitals.fallDetected.value = true
-                                SharedVitals.fallMessage.value  = fallMessage
+                                SharedVitals.fallMessage.value = fallMessage
                                 launchFallConfirmationActivity()
                             }
+
                             isVerifying = false
                         }
                     }
                 }
 
                 p < VETO_THRESHOLD -> {
-                    // FIX #5: Only reset when score is confidently non-fall (< 0.25),
-                    // not at the old 0.50 which was above the fall threshold itself.
                     if (!isVerifying) consecutiveHighScores = 0
                 }
 
-                else -> { /* ambiguous zone (0.25–0.45) — hold counter */ }
+                else -> {
+                    // ambiguous zone — hold counter
+                }
             }
-
         } catch (e: Exception) {
             Log.e("FALL_AI", "Inference error: ${e.message}", e)
         }
+
     }
 
     // ─────────────────────────────────────────────────────────────────────────

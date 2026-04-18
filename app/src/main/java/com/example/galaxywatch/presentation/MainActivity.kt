@@ -650,8 +650,8 @@ private suspend fun runBpMeasurement(
         validIbis.map { (it - meanIbiMs) * (it - meanIbiMs) }.average()
     ).toFloat()
 
-    val sbpRaw = ((-1.8425 * hr) + (-263.5957 * ibiSec) + 482.2377 - (hrv * 0.05)).toInt()
-    val dbpRaw = ((-1.5673  * hr) + (-176.5570 * ibiSec) + 341.2582 - (hrv * 0.03)).toInt()
+    val sbpRaw = ((-1.9888  * hr) + (-280.9351  * ibiSec) + 507.7330 - (hrv * 0.05)).toInt()
+    val dbpRaw = ((-1.7993   * hr) + (-203.4263 * ibiSec) + 380.6740 - (hrv * 0.03)).toInt()
 
     val sbp = sbpRaw.coerceIn(60, 220)
     val dbp = dbpRaw.coerceIn(40, 140)
