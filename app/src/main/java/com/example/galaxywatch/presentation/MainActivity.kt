@@ -53,8 +53,12 @@ import com.example.galaxywatch.SharedVitals
 import com.example.galaxywatch.presentation.theme.GalaxyWatchTheme
 import com.google.firebase.firestore.FirebaseFirestore
 import com.samsung.android.service.health.tracking.ConnectionListener
+import com.samsung.android.service.health.tracking.HealthTracker
 import com.samsung.android.service.health.tracking.HealthTrackerException
 import com.samsung.android.service.health.tracking.HealthTrackingService
+import com.samsung.android.service.health.tracking.data.DataPoint
+import com.samsung.android.service.health.tracking.data.HealthTrackerType
+import com.samsung.android.service.health.tracking.data.ValueKey
 import com.zegocloud.uikit.prebuilt.call.ZegoUIKitPrebuiltCallConfig
 import com.zegocloud.uikit.prebuilt.call.invite.ZegoUIKitPrebuiltCallInvitationConfig
 import com.zegocloud.uikit.prebuilt.call.invite.ZegoUIKitPrebuiltCallInvitationService
@@ -110,6 +114,11 @@ class MainActivity : ComponentActivity() {
     private var healthTrackingService: HealthTrackingService? = null
     var captureManager: PpgCaptureManager? = null
 
+    @Volatile var latestSpo2FromSdk: String = "--"
+    @Volatile var latestSpo2SdkTimestamp: Long = 0L
+
+    private var spo2Tracker: HealthTracker? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -156,6 +165,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // ── Samsung Health SDK: HR + SpO2 ────────────────────────────────────────
+
     private fun initSamsungHealthForUI() {
         val listener = object : ConnectionListener {
             override fun onConnectionSuccess() {
@@ -173,6 +184,58 @@ class MainActivity : ComponentActivity() {
         healthTrackingService?.connectService()
     }
 
+    internal fun startSpo2SdkTracker() {
+        val trackerType: HealthTrackerType? = try {
+            HealthTrackerType::class.java
+                .getField("SPO2_CONTINUOUS")
+                .get(null) as? HealthTrackerType
+        } catch (e: NoSuchFieldException) {
+            try {
+                HealthTrackerType::class.java
+                    .getField("SPO2")
+                    .get(null) as? HealthTrackerType
+            } catch (e2: NoSuchFieldException) {
+                Log.w("SPO2_SDK", "No SPO2 tracker available on this SDK")
+                null
+            }
+        }
+
+        if (trackerType == null) return
+
+        try {
+            spo2Tracker = healthTrackingService?.getHealthTracker(trackerType)
+            spo2Tracker?.setEventListener(object : HealthTracker.TrackerEventListener {
+                override fun onDataReceived(dataList: List<DataPoint>) {
+                    for (data in dataList) {
+                        try {
+                            val value = data.getValue(ValueKey.SpO2Set.SPO2) as? Int ?: continue
+                            if (value > 0) {
+                                latestSpo2FromSdk      = "$value%"
+                                latestSpo2SdkTimestamp = System.currentTimeMillis()
+                                Log.d("SPO2_SDK", "SDK reading: $value%")
+                            }
+                        } catch (e: Exception) {
+                            Log.e("SPO2_SDK", "Parse error: ${e.message}")
+                        }
+                    }
+                }
+                override fun onFlushCompleted() {}
+                override fun onError(e: HealthTracker.TrackerError?) {
+                    Log.e("SPO2_SDK", "Tracker error: $e")
+                }
+            })
+            Log.d("SPO2_SDK", "SpO2 tracker started: $trackerType")
+        } catch (e: Exception) {
+            Log.w("SPO2_SDK", "Could not start SpO2 tracker: ${e.message}")
+        }
+    }
+
+    internal fun stopSpo2SdkTracker() {
+        spo2Tracker?.unsetEventListener()
+        spo2Tracker = null
+        Log.d("SPO2_SDK", "SpO2 tracker stopped")
+    }
+
     private fun initZegoCloud() {
         val prefs     = getSharedPreferences("ElderCarePrefs", Context.MODE_PRIVATE)
         val patientId = prefs.getString("PATIENT_ID", "patient_001") ?: "patient_001"
@@ -186,8 +249,8 @@ class MainActivity : ComponentActivity() {
         invitationConfig.provider = ZegoUIKitPrebuiltCallConfigProvider { _ ->
             ZegoUIKitPrebuiltCallConfig.oneOnOneVoiceCall().also {
                 it.useSpeakerWhenJoining       = true
-                it.turnOnMicrophoneWhenJoining = true
-                it.topMenuBarConfig.isVisible  = false
+                it.turnOnMicrophoneWhenJoining  = true
+                it.topMenuBarConfig.isVisible   = false
             }
         }
         ZegoUIKitPrebuiltCallInvitationService.init(
@@ -202,6 +265,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        stopSpo2SdkTracker()
         ZegoUIKitPrebuiltCallInvitationService.unInit()
         captureManager?.release()
         healthTrackingService?.disconnectService()
@@ -234,18 +298,19 @@ fun WearApp(activity: MainActivity) {
     val fallDetected by SharedVitals.fallDetected.collectAsState()
     val fallMessage  by SharedVitals.fallMessage.collectAsState()
 
-    var bpState    by remember { mutableStateOf<BpState>(BpState.Idle) }
-    var spo2       by remember { mutableStateOf("--") }
+    var bpState        by remember { mutableStateOf<BpState>(BpState.Idle) }
+    var spo2           by remember { mutableStateOf("--") }
+    var isTrackingSpO2 by remember { mutableStateOf(false) }
 
-    // ── Gesture logging state ─────────────────────────────────────────────────
     var isLogging        by remember { mutableStateOf(false) }
     var loggingCountdown by remember { mutableStateOf(0) }
-    // ─────────────────────────────────────────────────────────────────────────
 
     DisposableEffect(lifecycleOwner) {
         val obs = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME && healthClient != null) {
-                scope.launch { spo2 = readLatestSpo2(healthClient) }
+            if (event == Lifecycle.Event.ON_RESUME && healthClient != null && !isTrackingSpO2) {
+                scope.launch {
+                    spo2 = readLatestSpo2(healthClient)
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(obs)
@@ -263,64 +328,54 @@ fun WearApp(activity: MainActivity) {
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState())
                     .padding(
-                        start = 4.dp,
-                        end = 4.dp,
-                        top = 24.dp,
+                        start  = 4.dp,
+                        end    = 4.dp,
+                        top    = 24.dp,
                         bottom = 72.dp
                     ),
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 // ── Vitals row 1: Heart Rate + Blood Pressure ─────────────────
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier              = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     VitalCard(
                         modifier = Modifier.weight(1f),
-                        icon = Icons.Default.Favorite,
+                        icon     = Icons.Default.Favorite,
                         iconTint = AccentRed,
-                        label = "Heart Rate"
+                        label    = "Heart Rate"
                     ) {
                         Text(
-                            text = heartRate,
-                            fontSize = 20.sp,
+                            text       = heartRate,
+                            fontSize   = 20.sp,
                             fontWeight = FontWeight.Bold,
-                            color = TextPrimary
+                            color      = TextPrimary
                         )
                         Text(
-                            text = "bpm",
+                            text     = "bpm",
                             fontSize = 9.sp,
-                            color = TextSecondary
+                            color    = TextSecondary
                         )
                     }
 
                     BpCard(
                         modifier = Modifier.weight(1f),
-                        bpState = bpState,
-                        onTap = {
+                        bpState  = bpState,
+                        onTap    = {
                             if (bpState is BpState.Measuring) {
-                                Toast.makeText(
-                                    context,
-                                    "Already measuring…",
-                                    Toast.LENGTH_SHORT
-                                ).show()
+                                Toast.makeText(context, "Already measuring…", Toast.LENGTH_SHORT).show()
                                 return@BpCard
                             }
-
                             if (activity.captureManager == null) {
-                                Toast.makeText(
-                                    context,
-                                    "Sensor connecting, please wait…",
-                                    Toast.LENGTH_LONG
-                                ).show()
+                                Toast.makeText(context, "Sensor connecting, please wait…", Toast.LENGTH_LONG).show()
                                 return@BpCard
                             }
-
                             scope.launch {
                                 runBpMeasurement(
                                     captureManager = activity.captureManager!!,
-                                    context = context,
-                                    onState = { bpState = it }
+                                    context        = context,
+                                    onState        = { bpState = it }
                                 )
                             }
                         }
@@ -329,113 +384,175 @@ fun WearApp(activity: MainActivity) {
 
                 // ── Vitals row 2: SpO2 + Fall Status ─────────────────────────
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier              = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
+                    // ── SpO2 Card ─────────────────────────────────────────────
                     VitalCard(
                         modifier = Modifier.weight(1f),
-                        icon = Icons.Default.Favorite,
+                        icon     = Icons.Default.Favorite,
                         iconTint = AccentBlue,
-                        label = "SpO2"
+                        label    = "SpO2"
                     ) {
                         Text(
-                            text = spo2,
-                            fontSize = 18.sp,
+                            text       = spo2,
+                            fontSize   = 18.sp,
                             fontWeight = FontWeight.Bold,
-                            color = TextPrimary
+                            color      = TextPrimary
                         )
+
+                        if (isTrackingSpO2) {
+                            Text(
+                                text     = "Syncing...",
+                                fontSize = 8.sp,
+                                color    = TextSecondary
+                            )
+                        }
+
                         Spacer(Modifier.height(3.dp))
+
+                        // TRACK button
                         Box(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(6.dp))
-                                .background(DividerColor)
-                                .clickable { launchSamsungHealthSpo2(context) }
+                                .background(
+                                    if (isTrackingSpO2) AccentBlue.copy(alpha = 0.2f)
+                                    else DividerColor
+                                )
+                                .clickable(enabled = !isTrackingSpO2) {
+                                    val trackStartMs = System.currentTimeMillis()
+                                    activity.latestSpo2SdkTimestamp = 0L
+                                    isTrackingSpO2 = true
+                                    spo2 = "..."
+
+                                    activity.startSpo2SdkTracker()
+                                    launchSamsungHealthSpo2(context)
+
+                                    scope.launch {
+                                        var found = false
+
+                                        repeat(180) {
+                                            if (found) return@repeat
+                                            delay(1_000L)
+
+                                            val sdkValue     = activity.latestSpo2FromSdk
+                                            val sdkTimestamp = activity.latestSpo2SdkTimestamp
+
+                                            if (sdkValue != "--" && sdkTimestamp > trackStartMs) {
+                                                spo2           = sdkValue
+                                                isTrackingSpO2 = false
+                                                found          = true
+                                                activity.stopSpo2SdkTracker()
+                                                Log.d("SPO2", "UI updated from SDK: $sdkValue")
+                                                return@repeat
+                                            }
+
+                                            if (healthClient != null) {
+                                                val hcResult = readLatestSpo2AfterTime(
+                                                    healthClient,
+                                                    Instant.ofEpochMilli(trackStartMs)
+                                                )
+                                                if (hcResult != null) {
+                                                    spo2           = hcResult
+                                                    isTrackingSpO2 = false
+                                                    found          = true
+                                                    activity.stopSpo2SdkTracker()
+                                                    Log.d("SPO2", "UI updated from HC: $hcResult")
+                                                }
+                                            }
+                                        }
+
+                                        // Timeout fallback
+                                        if (!found) {
+                                            activity.stopSpo2SdkTracker()
+                                            val lastKnown = if (healthClient != null)
+                                                readLatestSpo2(healthClient) else "--"
+                                            spo2           = if (lastKnown == "No Data") "--" else lastKnown
+                                            isTrackingSpO2 = false
+                                            Log.d("SPO2", "Poll timed out — last known: $spo2")
+                                        }
+                                    }
+
+                                    context.startService(
+                                        Intent(context, BackgroundVitalsService::class.java).apply {
+                                            action = BackgroundVitalsService.ACTION_AUTO_RETURN
+                                            putExtra("delay_ms", 50_000L)
+                                        }
+                                    )
+                                }
                                 .padding(horizontal = 6.dp, vertical = 2.dp)
                         ) {
                             Text(
-                                text = "OPEN",
-                                fontSize = 7.sp,
-                                color = AccentBlue,
+                                text       = if (isTrackingSpO2) "..." else "TRACK",
+                                fontSize   = 7.sp,
+                                color      = AccentBlue,
                                 fontWeight = FontWeight.Bold
                             )
                         }
                     }
 
+                    // ── Fall Status Card ──────────────────────────────────────
                     VitalCard(
-                        modifier = Modifier.weight(1f),
-                        icon = if (fallDetected) Icons.Default.Warning else Icons.Default.AccessibilityNew,
-                        iconTint = if (fallDetected) AccentRed else AccentGreen,
-                        label = "Fall Status",
-                        bgColor = if (fallDetected) AccentRed.copy(alpha = 0.2f) else CardBg,
+                        modifier    = Modifier.weight(1f),
+                        icon        = if (fallDetected) Icons.Default.Warning
+                        else Icons.Default.AccessibilityNew,
+                        iconTint    = if (fallDetected) AccentRed else AccentGreen,
+                        label       = "Fall Status",
+                        bgColor     = if (fallDetected) AccentRed.copy(alpha = 0.2f) else CardBg,
                         borderColor = if (fallDetected) AccentRed else DividerColor
                     ) {
                         Text(
-                            text = fallMessage,
-                            fontSize = 10.sp,
+                            text       = fallMessage,
+                            fontSize   = 10.sp,
                             fontWeight = FontWeight.Bold,
-                            color = if (fallDetected) AccentRed else AccentGreen,
-                            textAlign = TextAlign.Center
+                            color      = if (fallDetected) AccentRed else AccentGreen,
+                            textAlign  = TextAlign.Center
                         )
                     }
                 }
 
-                // ── Gesture Logger row ────────────────────────────────────────
-                GestureLoggerCard(
-                    isLogging = isLogging,
-                    countdown = loggingCountdown,
-                    onStartStop = {
-                        if (!isLogging) {
-                            // Start logging
-                            isLogging = true
-                            loggingCountdown = 30
-
-                            val intent = Intent(context, BackgroundVitalsService::class.java).apply {
-                                action = BackgroundVitalsService.ACTION_START_LOGGING
-                            }
-                            context.startService(intent)
-
-                            // Countdown timer — auto-stops at 0
-                            scope.launch {
-                                while (loggingCountdown > 0) {
-                                    delay(1000L)
-                                    loggingCountdown--
-                                }
-                                // Auto-stop when countdown hits zero
-                                if (isLogging) {
-                                    isLogging = false
-                                    val stopIntent = Intent(
-                                        context,
-                                        BackgroundVitalsService::class.java
-                                    ).apply {
-                                        action = BackgroundVitalsService.ACTION_STOP_LOGGING
-                                    }
-                                    context.startService(stopIntent)
-                                    Toast.makeText(
-                                        context,
-                                        "Gesture saved! Pull CSV from watch.",
-                                        Toast.LENGTH_LONG
-                                    ).show()
-                                }
-                            }
-                        } else {
-                            // Manual early stop
-                            isLogging = false
-                            loggingCountdown = 0
-                            val stopIntent = Intent(
-                                context,
-                                BackgroundVitalsService::class.java
-                            ).apply {
-                                action = BackgroundVitalsService.ACTION_STOP_LOGGING
-                            }
-                            context.startService(stopIntent)
-                            Toast.makeText(
-                                context,
-                                "Gesture saved! Pull CSV from watch.",
-                                Toast.LENGTH_LONG
-                            ).show()
-                        }
-                    }
-                )
+//                // ── Gesture Logger row ────────────────────────────────────────
+//                GestureLoggerCard(
+//                    isLogging   = isLogging,
+//                    countdown   = loggingCountdown,
+//                    onStartStop = {
+//                        if (!isLogging) {
+//                            isLogging        = true
+//                            loggingCountdown = 30
+//
+//                            context.startService(
+//                                Intent(context, BackgroundVitalsService::class.java).apply {
+//                                    action = BackgroundVitalsService.ACTION_START_LOGGING
+//                                }
+//                            )
+//
+//                            scope.launch {
+//                                while (loggingCountdown > 0) {
+//                                    delay(1000L)
+//                                    loggingCountdown--
+//                                }
+//                                if (isLogging) {
+//                                    isLogging = false
+//                                    context.startService(
+//                                        Intent(context, BackgroundVitalsService::class.java).apply {
+//                                            action = BackgroundVitalsService.ACTION_STOP_LOGGING
+//                                        }
+//                                    )
+//                                    Toast.makeText(context, "Gesture saved! Pull CSV from watch.", Toast.LENGTH_LONG).show()
+//                                }
+//                            }
+//                        } else {
+//                            isLogging        = false
+//                            loggingCountdown = 0
+//                            context.startService(
+//                                Intent(context, BackgroundVitalsService::class.java).apply {
+//                                    action = BackgroundVitalsService.ACTION_STOP_LOGGING
+//                                }
+//                            )
+//                            Toast.makeText(context, "Gesture saved! Pull CSV from watch.", Toast.LENGTH_LONG).show()
+//                        }
+//                    }
+//                )
             }
 
             // ── SOS Call button ───────────────────────────────────────────────
@@ -445,15 +562,11 @@ fun WearApp(activity: MainActivity) {
                     .padding(bottom = 8.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Text(
-                    text = "SOS CALL",
-                    fontSize = 7.sp,
-                    color = TextSecondary
-                )
+                Text(text = "SOS CALL", fontSize = 7.sp, color = TextSecondary)
                 Spacer(Modifier.height(2.dp))
                 AndroidView(
                     modifier = Modifier.size(40.dp),
-                    factory = { ctx ->
+                    factory  = { ctx ->
                         val themed = ContextThemeWrapper(
                             ctx,
                             android.R.style.Theme_DeviceDefault_NoActionBar
@@ -461,12 +574,7 @@ fun WearApp(activity: MainActivity) {
                         ZegoSendCallInvitationButton(themed).apply {
                             setIsVideoCall(false)
                             setInvitees(
-                                listOf(
-                                    ZegoUIKitUser(
-                                        "5yeapeXNTZcofATleG5ZHZ8siZt2",
-                                        "Caregiver"
-                                    )
-                                )
+                                listOf(ZegoUIKitUser("5yeapeXNTZcofATleG5ZHZ8siZt2", "Caregiver"))
                             )
                         } as android.view.View
                     }
@@ -480,8 +588,8 @@ fun WearApp(activity: MainActivity) {
 
 @Composable
 fun GestureLoggerCard(
-    isLogging: Boolean,
-    countdown: Int,
+    isLogging:   Boolean,
+    countdown:   Int,
     onStartStop: () -> Unit
 ) {
     val borderColor = if (isLogging) AccentPurple else DividerColor
@@ -497,44 +605,26 @@ fun GestureLoggerCard(
         contentAlignment = Alignment.Center
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier              = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+            verticalAlignment     = Alignment.CenterVertically
         ) {
-            // Left: label + status
             Column {
-                Text(
-                    text = "Gesture Logger",
-                    fontSize = 8.sp,
-                    color = TextSecondary
-                )
+                Text(text = "Gesture Logger", fontSize = 8.sp, color = TextSecondary)
                 if (isLogging) {
                     Text(
-                        text = "Recording… ${countdown}s left",
-                        fontSize = 9.sp,
+                        text       = "Recording… ${countdown}s left",
+                        fontSize   = 9.sp,
                         fontWeight = FontWeight.Bold,
-                        color = AccentPurple
+                        color      = AccentPurple
                     )
-                    Text(
-                        text = "Do your arm swing / gesture",
-                        fontSize = 7.sp,
-                        color = TextSecondary
-                    )
+                    Text(text = "Do your arm swing / gesture", fontSize = 7.sp, color = TextSecondary)
                 } else {
-                    Text(
-                        text = "Tap to record gestures",
-                        fontSize = 9.sp,
-                        color = TextSecondary
-                    )
-                    Text(
-                        text = "for AI training data",
-                        fontSize = 7.sp,
-                        color = TextSecondary
-                    )
+                    Text(text = "Tap to record gestures", fontSize = 9.sp, color = TextSecondary)
+                    Text(text = "for AI training data",   fontSize = 7.sp, color = TextSecondary)
                 }
             }
 
-            // Right: Start / Stop button
             Box(
                 modifier = Modifier
                     .clip(RoundedCornerShape(8.dp))
@@ -544,10 +634,10 @@ fun GestureLoggerCard(
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = if (isLogging) "STOP" else "START",
-                    fontSize = 9.sp,
+                    text       = if (isLogging) "STOP" else "START",
+                    fontSize   = 9.sp,
                     fontWeight = FontWeight.Bold,
-                    color = TextPrimary
+                    color      = TextPrimary
                 )
             }
         }
@@ -583,15 +673,12 @@ private suspend fun runBpMeasurement(
     exportDataToCsv(context, rawData)
 
     val cropSamples = (sampleRate * 2).toInt()
-    val cropped = if (rawData.size > cropSamples) {
-        rawData.subList(cropSamples, rawData.size)
-    } else {
-        rawData
-    }
+    val cropped = if (rawData.size > cropSamples) rawData.subList(cropSamples, rawData.size)
+    else rawData
 
     val filtered = ArrayList<SensorReading>(cropped.size)
-    var smoothed = cropped[0].value
-    var baseline = cropped[0].value
+    var smoothed  = cropped[0].value
+    var baseline  = cropped[0].value
 
     for (r in cropped) {
         smoothed += 0.3f * (r.value - smoothed)
@@ -610,12 +697,10 @@ private suspend fun runBpMeasurement(
         val prev    = filtered[i - 1].value
         val current = filtered[i].value
         val next    = filtered[i + 1].value
-
-        val isPeak = current > prev &&
+        val isPeak  = current > prev &&
                 current >= next &&
                 current > threshold &&
                 (filtered[i].timestamp - lastPeak) > minPeakDistanceMs
-
         if (isPeak) {
             peaks.add(filtered[i].timestamp)
             lastPeak = filtered[i].timestamp
@@ -637,21 +722,17 @@ private suspend fun runBpMeasurement(
         it >= medianIbi * 0.75f && it <= medianIbi * 1.25f
     }
 
-    if (validIbis.isEmpty()) {
-        onState(BpState.TooNoisy)
-        return
-    }
+    if (validIbis.isEmpty()) { onState(BpState.TooNoisy); return }
 
     val meanIbiMs = validIbis.average()
     val ibiSec    = (meanIbiMs / 1000.0).toFloat()
     val hr        = (60f / ibiSec).toInt()
-
-    val hrv = Math.sqrt(
+    val hrv       = Math.sqrt(
         validIbis.map { (it - meanIbiMs) * (it - meanIbiMs) }.average()
     ).toFloat()
 
-    val sbpRaw = ((-1.9888  * hr) + (-280.9351  * ibiSec) + 507.7330 - (hrv * 0.05)).toInt()
-    val dbpRaw = ((-1.7993   * hr) + (-203.4263 * ibiSec) + 380.6740 - (hrv * 0.03)).toInt()
+    val sbpRaw = ((-1.9888 * hr) + (-280.9351 * ibiSec) + 507.7330 - (hrv * 0.05)).toInt()
+    val dbpRaw = ((-1.7993 * hr) + (-203.4263 * ibiSec) + 380.6740 - (hrv * 0.03)).toInt()
 
     val sbp = sbpRaw.coerceIn(60, 220)
     val dbp = dbpRaw.coerceIn(40, 140)
@@ -673,11 +754,7 @@ fun saveBpToFirebase(context: Context, sbp: Int, dbp: Int, category: BpCategory)
     val bpString  = "$sbp/$dbp"
     val timestamp = System.currentTimeMillis()
 
-    val liveUpdates = mapOf(
-        "bloodPressure" to bpString,
-        "bpStatus"      to category.label
-    )
-
+    val liveUpdates = mapOf("bloodPressure" to bpString, "bpStatus" to category.label)
     val historyData = mapOf(
         "bloodPressure" to bpString,
         "bpStatus"      to category.label,
@@ -687,23 +764,11 @@ fun saveBpToFirebase(context: Context, sbp: Int, dbp: Int, category: BpCategory)
     )
 
     val patientRef = db.collection("patients").document(patientId)
-
-    patientRef
-        .set(liveUpdates, com.google.firebase.firestore.SetOptions.merge())
-        .addOnFailureListener { e ->
-            Log.e("BP_FIREBASE", "Failed to update live BP: ${e.message}")
-        }
-
-    patientRef
-        .collection("blood_pressure")
-        .document(timestamp.toString())
-        .set(historyData)
-        .addOnSuccessListener {
-            Log.d("BP_FIREBASE", "✅ Saved BP: $bpString (${category.label})")
-        }
-        .addOnFailureListener { e ->
-            Log.e("BP_FIREBASE", "Failed to save BP history: ${e.message}")
-        }
+    patientRef.set(liveUpdates, com.google.firebase.firestore.SetOptions.merge())
+        .addOnFailureListener { e -> Log.e("BP_FIREBASE", "Live update failed: ${e.message}") }
+    patientRef.collection("blood_pressure").document(timestamp.toString()).set(historyData)
+        .addOnSuccessListener { Log.d("BP_FIREBASE", "✅ Saved BP: $bpString (${category.label})") }
+        .addOnFailureListener { e -> Log.e("BP_FIREBASE", "History save failed: ${e.message}") }
 }
 
 // ─── BP Card ──────────────────────────────────────────────────────────────────
@@ -739,9 +804,8 @@ fun BpCard(modifier: Modifier, bpState: BpState, onTap: () -> Unit) {
 
             when (bpState) {
                 is BpState.Idle -> {
-                    Text("Tap to",  fontSize = 9.sp,  color = TextSecondary)
-                    Text("Measure", fontSize = 10.sp, color = AccentBlue,
-                        fontWeight = FontWeight.Bold)
+                    Text("Tap to",  fontSize = 9.sp, color = TextSecondary)
+                    Text("Measure", fontSize = 10.sp, color = AccentBlue, fontWeight = FontWeight.Bold)
                 }
                 is BpState.Measuring -> {
                     Text(
@@ -759,11 +823,7 @@ fun BpCard(modifier: Modifier, bpState: BpState, onTap: () -> Unit) {
                         fontWeight = FontWeight.Bold,
                         color      = bpState.category.color
                     )
-                    Text(
-                        text     = "${bpState.dbp} mmHg",
-                        fontSize = 10.sp,
-                        color    = TextSecondary
-                    )
+                    Text(text = "${bpState.dbp} mmHg", fontSize = 10.sp, color = TextSecondary)
                     Spacer(Modifier.height(2.dp))
                     Box(
                         modifier = Modifier
@@ -782,15 +842,13 @@ fun BpCard(modifier: Modifier, bpState: BpState, onTap: () -> Unit) {
                     Text("Tap to retry", fontSize = 7.sp, color = TextSecondary)
                 }
                 is BpState.TooNoisy -> {
-                    Text("Too Noisy", fontSize = 9.sp,
-                        color = AccentAmber, fontWeight = FontWeight.Bold)
+                    Text("Too Noisy", fontSize = 9.sp, color = AccentAmber, fontWeight = FontWeight.Bold)
                     Text("Move less,", fontSize = 8.sp, color = TextSecondary)
                     Text("tap retry",  fontSize = 8.sp, color = TextSecondary)
                 }
                 is BpState.SensorError -> {
-                    Text("Sensor",  fontSize = 9.sp,
-                        color = AccentRed, fontWeight = FontWeight.Bold)
-                    Text("Error",   fontSize = 9.sp, color = AccentRed)
+                    Text("Sensor",    fontSize = 9.sp, color = AccentRed, fontWeight = FontWeight.Bold)
+                    Text("Error",     fontSize = 9.sp, color = AccentRed)
                     Text("Tap retry", fontSize = 7.sp, color = TextSecondary)
                 }
             }
@@ -846,24 +904,50 @@ fun exportDataToCsv(context: Context, data: List<SensorReading>) {
     }
 }
 
+// ─── Samsung Health SpO2 launcher ────────────────────────────────────────────
+
 fun launchSamsungHealthSpo2(context: Context) {
-    for (pkg in listOf("com.sec.android.app.shealth", "com.samsung.android.wear.shealth")) {
+    val pkg = "com.samsung.android.wear.shealth"
+
+    val actions = listOf(
+        "com.samsung.android.wear.shealth.intent.action.VIEW_SPO2_MEASURE",
+        "com.samsung.android.wear.shealth.intent.action.VIEW_SPO2_MAIN"
+    )
+    for (action in actions) {
         try {
             context.startActivity(
-                Intent(Intent.ACTION_VIEW, Uri.parse("shealth://oxygen_saturation"))
-                    .setPackage(pkg)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                Intent(action).apply {
+                    setPackage(pkg)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                }
             )
             return
-        } catch (_: Exception) {
-            try {
-                context.packageManager.getLaunchIntentForPackage(pkg)
-                    ?.let { context.startActivity(it); return }
-            } catch (_: Exception) {}
-        }
+        } catch (_: Exception) {}
     }
-    Toast.makeText(context, "Samsung Health not installed", Toast.LENGTH_SHORT).show()
+
+    val activities = listOf(
+        "$pkg.app.spo2.view.measure.Spo2MeasuringActivity",
+        "$pkg.app.spo2.view.Spo2Activity"
+    )
+    for (activityClass in activities) {
+        try {
+            context.startActivity(
+                Intent().apply {
+                    setClassName(pkg, activityClass)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                }
+            )
+            return
+        } catch (_: Exception) {}
+    }
+
+    context.packageManager.getLaunchIntentForPackage(pkg)
+        ?.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+        ?.let { context.startActivity(it) }
+        ?: Toast.makeText(context, "Samsung Health not found", Toast.LENGTH_SHORT).show()
 }
+
+// ─── Health Connect SpO2 readers ─────────────────────────────────────────────
 
 suspend fun readLatestSpo2(client: HealthConnectClient): String = try {
     val resp: ReadRecordsResponse<OxygenSaturationRecord> = client.readRecords(
@@ -883,4 +967,23 @@ suspend fun readLatestSpo2(client: HealthConnectClient): String = try {
 } catch (e: Exception) {
     Log.e("SPO2", "Health Connect error: ${e.message}", e)
     "Perm needed"
+}
+
+suspend fun readLatestSpo2AfterTime(
+    client: HealthConnectClient,
+    after:  Instant
+): String? = try {
+    val resp: ReadRecordsResponse<OxygenSaturationRecord> = client.readRecords(
+        ReadRecordsRequest(
+            recordType      = OxygenSaturationRecord::class,
+            timeRangeFilter = TimeRangeFilter.between(after, Instant.now()),
+            ascendingOrder  = false,
+            pageSize        = 1
+        )
+    )
+    resp.records.firstOrNull()
+        ?.let { "${it.percentage.value.toInt()}%" }
+} catch (e: Exception) {
+    Log.e("SPO2", "Poll error: ${e.message}", e)
+    null
 }

@@ -42,6 +42,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         const val ACTION_TRIGGER_SOS   = "ACTION_TRIGGER_SOS"
         const val ACTION_START_LOGGING = "ACTION_START_LOGGING"
         const val ACTION_STOP_LOGGING  = "ACTION_STOP_LOGGING"
+        const val ACTION_AUTO_RETURN   = "ACTION_AUTO_RETURN"
 
         private const val PREFS_SYSTEM_STATE = "SYSTEM_STATE"
         private const val KEY_SOS_ACTIVE     = "SOS_ACTIVE"
@@ -58,60 +59,26 @@ class BackgroundVitalsService : Service(), SensorEventListener {
     private var wakeLock: PowerManager.WakeLock? = null
 
     private var healthTrackingService: HealthTrackingService? = null
-    private var hrTracker: HealthTracker? = null
+    private var hrTracker:   HealthTracker? = null
     private var tflite: Interpreter? = null
 
     // ── Detection thresholds ──────────────────────────────────────────────────
-    //
-    // FIX #5: Corrected threshold values.
-    //   - FALL_THRESHOLD  = score must EXCEED this to count as a suspected fall.
-    //   - VETO_THRESHOLD  = score must be BELOW this to reset the counter.
-    //   - The gap (0.25 – 0.45) is the true ambiguous zone where the counter holds.
-    //
-    // Previously VETO (0.50) > FALL (0.40) made the ambiguous branch unreachable:
-    // any p > 0.40 hit the increment branch first, so the veto only fired at p ≤ 0.40.
-    // Now the two thresholds are properly separated.
-    //
-    // FIX #2: CONFIRMATION_WINDOWS reduced from 3 → 1.
-    //   Each window step = 128 samples × (1/50 Hz) = 2.56 seconds.
-    //   3 consecutive windows = ~7+ seconds of sustained high scores — a fall is
-    //   a 1-2 second event; after impact the person is still (low variance) so the
-    //   stillness pre-screen skips those windows and the counter never reaches 3.
-    //   1 strong window is enough; the 1.5 s post-impact stillness check is the
-    //   real safeguard against false positives.
-    private val CONFIRMATION_WINDOWS         = 2      // FIX #2 (was 3)
-    private val FALL_THRESHOLD               = 0.68f   // FIX #5 (was 0.40)
-    private val VETO_THRESHOLD               = 0.25f   // FIX #5 (was 0.50 — inverted logic)
+    private val CONFIRMATION_WINDOWS         = 2
+    private val FALL_THRESHOLD               = 0.68f
+    private val VETO_THRESHOLD               = 0.25f
     private val STILLNESS_VARIANCE_THRESHOLD = 0.3f
     private val POST_FALL_MOVEMENT_VETO      = 0.10f
 
     // ── Sensor buffers ────────────────────────────────────────────────────────
-    //
-    // FIX #1 + FIX #3: Buffer redesign to match training.
-    //
-    // TRAINING used WINDOW_SIZE=256 raw samples resampled to TARGET_LEN=512,
-    // with OVERLAP=128 (50 % overlap). At 50 Hz, 256 samples = 5.12 s.
-    //
-    // ORIGINAL KOTLIN used 512 raw samples (= 10.24 s) fed directly to the model,
-    // making every window appear at half the temporal "speed" the model expects.
-    // Fall impact spikes were stretched out; arm-swing bursts occupied a different
-    // fraction of the window than in training → wrong pattern matching.
-    //
-    // NEW: collect 256 raw samples, resample to 512, then normalise — exactly
-    // matching the training pipeline.
-    //
-    // FIX #3: Gyro is now written at the same index as accel (driven by the
-    // accelerometer event), so both channels are always time-aligned.
-    // latestGyroMag holds the most-recent gyro magnitude from its own callback.
-    private val RAW_WINDOW   = 256   // collect this many raw samples   (= 5.12 s @ 50 Hz)
-    private val RAW_OVERLAP  = 128   // slide by this many after a window fires
-    private val MODEL_LEN    = 512   // model input length (resampled target)
+    private val RAW_WINDOW  = 256
+    private val RAW_OVERLAP = 128
+    private val MODEL_LEN   = 512
 
-    private val accelBuffer  = FloatArray(RAW_WINDOW)
-    private val gyroBuffer   = FloatArray(RAW_WINDOW)  // filled in lockstep with accel
+    private val accelBuffer = FloatArray(RAW_WINDOW)
+    private val gyroBuffer  = FloatArray(RAW_WINDOW)
 
-    @Volatile private var bufferIndex     = 0      // FIX #3: single shared index
-    @Volatile private var latestGyroMag   = 0f     // FIX #3: latest gyro sample
+    @Volatile private var bufferIndex   = 0
+    @Volatile private var latestGyroMag = 0f
 
     @Volatile private var consecutiveHighScores = 0
     @Volatile private var isVerifying           = false
@@ -135,6 +102,9 @@ class BackgroundVitalsService : Service(), SensorEventListener {
     private val loggedWindows = mutableListOf<Pair<FloatArray, FloatArray>>()
     private val loggingLock   = Any()
 
+    // ── Safety timeout job for unacknowledged fall confirmations ──────────────
+    private var fallSafetyTimeoutJob: Job? = null
+
     // ─────────────────────────────────────────────────────────────────────────
     //  Lifecycle
     // ─────────────────────────────────────────────────────────────────────────
@@ -150,11 +120,8 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
 
-        // Accelerometer at 50 Hz (20 000 µs) — drives both channels
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-        accelerometer?.let { sensorManager.registerListener(this, it, 20_000) }
-
-        // Gyroscope at same 50 Hz — latestGyroMag is read on every accel event
+        accelerometer?.let { sensorManager.registerListener(this, it, 20_000) } // 50 Hz
         gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
         if (gyroscope != null) {
             sensorManager.registerListener(this, gyroscope!!, 20_000)
@@ -194,6 +161,10 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
             ACTION_CANCEL_FALL -> {
                 Log.d("FALL_AI", "User cancelled fall alert")
+                // Cancel the safety timeout — user responded in time
+                fallSafetyTimeoutJob?.cancel()
+                fallSafetyTimeoutJob = null
+
                 fallDetected          = false
                 fallMessage           = "Scanning..."
                 consecutiveHighScores = 0
@@ -206,6 +177,11 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
             ACTION_CONFIRM_FALL -> {
                 Log.d("FALL_AI", "Fall confirmed after timeout")
+                // Cancel the safety timeout — it has been handled via confirm path
+                fallSafetyTimeoutJob?.cancel()
+                fallSafetyTimeoutJob = null
+
+                // ✅ This is the ONLY place fallDetected is set to true
                 fallDetected = true
                 fallMessage  = "FALL DETECTED!"
                 SharedVitals.fallDetected.value = true
@@ -225,7 +201,28 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                 }
                 return START_STICKY
             }
+
+            ACTION_AUTO_RETURN -> {
+                val delayMs = intent.getLongExtra("delay_ms", 50_000L)
+                serviceScope.launch {
+                    delay(delayMs)
+                    Log.d("SPO2", "Auto-returning to app after ${delayMs}ms")
+                    startActivity(
+                        Intent(
+                            this@BackgroundVitalsService,
+                            com.example.galaxywatch.presentation.MainActivity::class.java
+                        ).apply {
+                            addFlags(
+                                Intent.FLAG_ACTIVITY_NEW_TASK or
+                                        Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                            )
+                        }
+                    )
+                }
+                return START_STICKY
+            }
         }
+
         return START_STICKY
     }
 
@@ -250,12 +247,6 @@ class BackgroundVitalsService : Service(), SensorEventListener {
     override fun onSensorChanged(event: SensorEvent?) {
         when (event?.sensor?.type) {
 
-            // ── Accelerometer ─────────────────────────────────────────────────
-            //
-            // FIX #1 + FIX #3: Accumulate RAW_WINDOW (256) samples into accelBuffer
-            // and gyroBuffer in lockstep using a single index (bufferIndex).
-            // When full, resample both channels to MODEL_LEN (512) before inference
-            // — matching the training pipeline exactly.
             Sensor.TYPE_ACCELEROMETER -> {
                 if (!isWatchOnWrist) return
 
@@ -265,7 +256,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                 synchronized(bufferLock) {
                     if (bufferIndex < RAW_WINDOW) {
                         accelBuffer[bufferIndex] = mag
-                        gyroBuffer[bufferIndex]  = latestGyroMag  // FIX #3: time-aligned
+                        gyroBuffer[bufferIndex]  = latestGyroMag
                         bufferIndex++
                     }
 
@@ -273,13 +264,11 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                         val accelSnap = accelBuffer.copyOf()
                         val gyroSnap  = gyroBuffer.copyOf()
 
-                        // FIX #1: Slide by RAW_OVERLAP (128) = 50 % overlap, matching training
                         System.arraycopy(accelBuffer, RAW_OVERLAP, accelBuffer, 0, RAW_WINDOW - RAW_OVERLAP)
                         System.arraycopy(gyroBuffer,  RAW_OVERLAP, gyroBuffer,  0, RAW_WINDOW - RAW_OVERLAP)
                         bufferIndex = RAW_WINDOW - RAW_OVERLAP
 
                         serviceScope.launch {
-                            // FIX #1: Resample 256 → 512 to match training's resample_and_normalize
                             val accelResampled = linearResample(accelSnap, MODEL_LEN)
                             val gyroResampled  = linearResample(gyroSnap,  MODEL_LEN)
 
@@ -296,18 +285,12 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                 }
             }
 
-            // ── Gyroscope ─────────────────────────────────────────────────────
-            //
-            // FIX #3: Only update latestGyroMag here. Writing into the buffer is
-            // done exclusively in the accelerometer handler so both channels share
-            // the same index and are always time-aligned.
             Sensor.TYPE_GYROSCOPE -> {
                 if (!isWatchOnWrist) return
                 val gx  = event.values[0]; val gy = event.values[1]; val gz = event.values[2]
                 latestGyroMag = Math.sqrt((gx*gx + gy*gy + gz*gz).toDouble()).toFloat()
             }
 
-            // ── Off-body detect ───────────────────────────────────────────────
             Sensor.TYPE_LOW_LATENCY_OFFBODY_DETECT -> {
                 val onBody = event.values[0] != 0f
                 if (isWatchOnWrist != onBody) {
@@ -315,7 +298,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                     if (!isWatchOnWrist) {
                         currentHeartRate = "--"
                         SharedVitals.heartRate.value = "--"
-                        synchronized(bufferLock) { bufferIndex = 0 }  // FIX #3: reset single index
+                        synchronized(bufferLock) { bufferIndex = 0 }
                     }
                     pushDataUpdates(forceFirebase = true)
                 }
@@ -326,16 +309,9 @@ class BackgroundVitalsService : Service(), SensorEventListener {
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  FIX #1 helper: linear resampling (mirrors training's np.interp)
-    //
-    //  input  — raw FloatArray of size RAW_WINDOW (256)
-    //  target — desired output length MODEL_LEN (512)
-    //
-    //  This is equivalent to:
-    //    x_old = np.linspace(0, 1, len(signal))
-    //    x_new = np.linspace(0, 1, TARGET_LEN)
-    //    resampled = np.interp(x_new, x_old, signal)
+    //  Linear resampling helper
     // ─────────────────────────────────────────────────────────────────────────
+
     private fun linearResample(input: FloatArray, targetLen: Int): FloatArray {
         if (input.size == targetLen) return input.copyOf()
         val output = FloatArray(targetLen)
@@ -350,7 +326,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  Fall detection inference  (receives MODEL_LEN = 512 samples)
+    //  Fall detection inference
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun runFallDetectionInference(accelBuf: FloatArray, gyroBuf: FloatArray) {
@@ -360,9 +336,6 @@ class BackgroundVitalsService : Service(), SensorEventListener {
             return
         }
 
-        // ─────────────────────────────────────────────
-        // BASIC SIGNAL STATS
-        // ─────────────────────────────────────────────
         val accelMean = accelBuf.average().toFloat()
         val accelVar  = accelBuf.map { (it - accelMean) * (it - accelMean) }.average().toFloat()
         val maxG      = accelBuf.maxOrNull() ?: 0f
@@ -401,11 +374,8 @@ class BackgroundVitalsService : Service(), SensorEventListener {
             return
         }
 
-        // ─────────────────────────────────────────────
-        // NORMALISE CHANNELS (same as training)
-        // ─────────────────────────────────────────────
         fun normalise(buf: FloatArray): FloatArray {
-            val m = buf.average().toFloat()
+            val m   = buf.average().toFloat()
             val std = kotlin.math.sqrt(
                 buf.map { ((it - m) * (it - m)).toDouble() }.average()
             ).toFloat()
@@ -415,9 +385,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         val normAccel = normalise(accelBuf)
         val normGyro  = normalise(gyroBuf)
 
-        val input = Array(1) { Array(MODEL_LEN) { i ->
-            floatArrayOf(normAccel[i], normGyro[i])
-        }}
+        val input  = Array(1) { Array(MODEL_LEN) { i -> floatArrayOf(normAccel[i], normGyro[i]) } }
         val output = Array(1) { FloatArray(1) }
 
         try {
@@ -442,11 +410,11 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                             delay(2500L)
 
                             var recentAccelVar = 0f
-                            var recentGyroMax = 0f
+                            var recentGyroMax  = 0f
 
                             synchronized(bufferLock) {
                                 val end   = bufferIndex
-                                val start = (end - 125).coerceAtLeast(0) // last 2.5 sec @ 50Hz
+                                val start = (end - 125).coerceAtLeast(0)
 
                                 val recentA = accelBuffer.slice(start until end)
                                 val recentG = gyroBuffer.slice(start until end)
@@ -458,43 +426,36 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                                         .average()
                                         .toFloat()
                                 }
-
                                 if (recentG.isNotEmpty()) {
                                     recentGyroMax = recentG.maxOrNull() ?: 0f
                                 }
                             }
 
-                            val stillAfterImpact = recentAccelVar <= POST_FALL_MOVEMENT_VETO
+                            val stillAfterImpact       = recentAccelVar <= POST_FALL_MOVEMENT_VETO
                             val lowRotationAfterImpact = recentGyroMax < 1.2f
 
-                            // ─────────────────────────────────────────────
-                            // NEW RULE 2: JUMP / RISKY MOVEMENT
-                            // strong impact + strong rotation + continues moving
-                            // ─────────────────────────────────────────────
                             if (!stillAfterImpact && recentGyroMax > 1.8f && maxG > 14f) {
                                 Log.w(
                                     "FALL_AI",
                                     "RISKY MOVEMENT: jump-like / forceful landing (recentVar=${"%.2f".format(recentAccelVar)}, recentGyro=${"%.2f".format(recentGyroMax)})"
                                 )
                                 fallDetected = false
-                                fallMessage = "Risky Movement!"
+                                fallMessage  = "Risky Movement!"
                                 SharedVitals.fallDetected.value = false
-                                SharedVitals.fallMessage.value = fallMessage
+                                SharedVitals.fallMessage.value  = fallMessage
                                 pushDataUpdates(forceFirebase = true)
                                 consecutiveHighScores = 0
-                                isVerifying = false
+                                isVerifying           = false
                                 return@launch
                             }
 
-                            // ─────────────────────────────────────────────
-                            // NORMAL FALL VETO
-                            // ─────────────────────────────────────────────
                             if (!stillAfterImpact || !lowRotationAfterImpact) {
                                 Log.d(
                                     "FALL_AI",
                                     "VETOED: continued motion after impact (var=${"%.2f".format(recentAccelVar)}, gyro=${"%.2f".format(recentGyroMax)})"
                                 )
                                 consecutiveHighScores = 0
+                                isVerifying           = false
                             } else {
                                 Log.w(
                                     "FALL_AI",
@@ -502,23 +463,53 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                                 )
 
                                 if (ignoreFallDetection || isManualSosActive || isSosActiveFromPrefs()) {
+                                    // ✅ SOS already active — do not set fallDetected at all
                                     fallDetected = false
-                                    fallMessage = "Scanning..."
+                                    fallMessage  = "Scanning..."
                                     SharedVitals.fallDetected.value = false
-                                    SharedVitals.fallMessage.value = fallMessage
+                                    SharedVitals.fallMessage.value  = fallMessage
                                     pushDataUpdates(forceFirebase = true)
                                     isVerifying = false
                                     return@launch
                                 }
 
-                                fallDetected = true
-                                fallMessage = "Checking..."
-                                SharedVitals.fallDetected.value = true
-                                SharedVitals.fallMessage.value = fallMessage
+                                // ✅ FIX: Only show "Checking..." status — do NOT set fallDetected=true yet.
+                                // fallDetected stays false until ACTION_CONFIRM_FALL is received
+                                // (i.e. user ignores the 10-second countdown in FallConfirmationActivity).
+                                fallDetected = false
+                                fallMessage  = "Checking..."
+                                SharedVitals.fallDetected.value = false
+                                SharedVitals.fallMessage.value  = fallMessage
+                                pushDataUpdates(forceFirebase = true)
+
+                                // Launch the confirmation screen
                                 launchFallConfirmationActivity()
+
+                                // ✅ FIX: Safety timeout — if FallConfirmationActivity never responds
+                                // (e.g. it was blocked, killed, or the user missed it entirely),
+                                // reset the "Checking..." state cleanly after 15 seconds.
+                                // The activity's own 10-second countdown will send ACTION_CONFIRM_FALL
+                                // or ACTION_CANCEL_FALL before this fires in the normal flow,
+                                // and both of those actions cancel this job immediately.
+                                fallSafetyTimeoutJob?.cancel()
+                                fallSafetyTimeoutJob = serviceScope.launch {
+                                    delay(15_000L)
+                                    if (isVerifying) {
+                                        Log.w("FALL_AI", "Safety timeout: resetting unacknowledged fall state")
+                                        fallDetected          = false
+                                        fallMessage           = "Scanning..."
+                                        consecutiveHighScores = 0
+                                        isVerifying           = false
+                                        SharedVitals.fallDetected.value = false
+                                        SharedVitals.fallMessage.value  = fallMessage
+                                        pushDataUpdates(forceFirebase = true)
+                                    }
+                                }
                             }
 
-                            isVerifying = false
+                            // Note: isVerifying is intentionally NOT reset here in the confirmed
+                            // branch — it stays true until ACTION_CONFIRM_FALL or ACTION_CANCEL_FALL
+                            // arrives, which prevents duplicate detections during the confirmation window.
                         }
                     }
                 }
@@ -527,29 +518,17 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                     if (!isVerifying) consecutiveHighScores = 0
                 }
 
-                else -> {
-                    // ambiguous zone — hold counter
-                }
+                else -> { /* ambiguous zone — hold counter */ }
             }
         } catch (e: Exception) {
             Log.e("FALL_AI", "Inference error: ${e.message}", e)
         }
-
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Gesture logger
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Saves captured 2-channel windows to CSV.
-     * Columns: label, a0..a511, g0..g511
-     *
-     * Note: windows are already resampled to 512 points (matching training).
-     *
-     * Pull from watch:
-     *   adb pull /sdcard/Android/data/com.example.galaxywatch/files/ ./watch_data/
-     */
     private fun saveLoggedData(label: Int) {
         val windows: List<Pair<FloatArray, FloatArray>>
         synchronized(loggingLock) {
@@ -565,7 +544,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         serviceScope.launch {
             try {
                 val filename = "gesture_log_label${label}_${System.currentTimeMillis()}.csv"
-                val file = File(getExternalFilesDir(null), filename)
+                val file     = File(getExternalFilesDir(null), filename)
 
                 file.bufferedWriter().use { w ->
                     val accelCols = (0 until MODEL_LEN).joinToString(",") { "a$it" }
@@ -579,7 +558,6 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                 }
 
                 Log.d("GESTURE_LOG", "Saved ${windows.size} windows → ${file.absolutePath}")
-
             } catch (e: Exception) {
                 Log.e("GESTURE_LOG", "Save failed: ${e.message}", e)
             }
@@ -653,7 +631,17 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         if (ignoreFallDetection || isManualSosActive || isSosActiveFromPrefs()) return
         startActivity(
             Intent(this, com.example.galaxywatch.presentation.FallConfirmationActivity::class.java)
-                .apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP) }
+                .apply {
+                    addFlags(
+                        // ✅ FIX: Added FLAG_ACTIVITY_SINGLE_TOP and FLAG_ACTIVITY_REORDER_TO_FRONT
+                        // so the activity reliably surfaces when the app is backgrounded or the
+                        // watch is in ambient/lock mode.
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                                Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                                Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                    )
+                }
         )
     }
 
@@ -669,6 +657,10 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         SharedVitals.fallDetected.value = false
         SharedVitals.fallMessage.value  = fallMessage
         pushDataUpdates(forceFirebase = true)
+
+        // Also cancel any pending fall safety timeout
+        fallSafetyTimeoutJob?.cancel()
+        fallSafetyTimeoutJob = null
 
         sosSuppressionJob?.cancel()
         sosSuppressionJob = serviceScope.launch {
