@@ -52,10 +52,6 @@ class FallConfirmationActivity : ComponentActivity() {
             return
         }
 
-        // ✅ FIX: These window flags force the activity to appear even when the watch
-        // is in ambient mode, the screen is off, or the app is backgrounded.
-        // Without FLAG_SHOW_WHEN_LOCKED and FLAG_TURN_SCREEN_ON, the activity is
-        // created but the screen stays dark — the user never sees the alert.
         @Suppress("DEPRECATION")
         window.addFlags(
             WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
@@ -75,11 +71,11 @@ class FallConfirmationActivity : ComponentActivity() {
                         handled = true
                         stopVibration()
 
-                        // Cancel the fall alert — user responded in time
-                        val cancelIntent = Intent(this, BackgroundVitalsService::class.java).apply {
-                            action = BackgroundVitalsService.ACTION_CANCEL_FALL
-                        }
-                        startService(cancelIntent)
+                        startService(
+                            Intent(this, BackgroundVitalsService::class.java).apply {
+                                action = BackgroundVitalsService.ACTION_CANCEL_FALL
+                            }
+                        )
                         finish()
                     },
                     onTimeout = {
@@ -87,19 +83,23 @@ class FallConfirmationActivity : ComponentActivity() {
                         handled = true
                         stopVibration()
 
-                        // First confirm the fall in the service (this sets fallDetected=true in Firebase)
-                        val confirmIntent = Intent(this, BackgroundVitalsService::class.java).apply {
-                            action = BackgroundVitalsService.ACTION_CONFIRM_FALL
-                        }
-                        startService(confirmIntent)
+                        // Confirm the fall first so UI stays on FALL DETECTED for 1 minute
+                        startService(
+                            Intent(this, BackgroundVitalsService::class.java).apply {
+                                action = BackgroundVitalsService.ACTION_CONFIRM_FALL
+                            }
+                        )
 
-                        // Then suppress fall re-triggering and launch SOS call
-                        val sosSuppressIntent = Intent(this, BackgroundVitalsService::class.java).apply {
-                            action = BackgroundVitalsService.ACTION_TRIGGER_SOS
-                        }
-                        startService(sosSuppressIntent)
-
-                        startActivity(Intent(this, SosActivity::class.java))
+                        // Go to SOS screen, but do NOT clear the fall state here
+                        startActivity(
+                            Intent(this, SosActivity::class.java).apply {
+                                addFlags(
+                                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                                            Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                                            Intent.FLAG_ACTIVITY_SINGLE_TOP
+                                )
+                            }
+                        )
                         finish()
                     }
                 )
