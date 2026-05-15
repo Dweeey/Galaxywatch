@@ -53,7 +53,6 @@
             android:name="com.google.android.wearable.standalone"
             android:value="true" />
 
-        <!-- Main app launcher -->
         <activity
             android:name=".presentation.LoginActivity"
             android:exported="true"
@@ -64,16 +63,10 @@
             </intent-filter>
         </activity>
 
-        <!-- SOS launcher for hardware button mapping -->
         <activity
             android:name=".presentation.SosLauncherActivity"
             android:exported="true"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <activity
             android:name=".presentation.MainActivity"
@@ -99,13 +92,15 @@
             android:exported="false"
             android:excludeFromRecents="true"
             android:launchMode="singleTop"
-            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
+            android:showWhenLocked="true"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+            android:turnScreenOn="true" />
 
         <activity-alias
             android:name="ViewPermissionUsageActivity"
             android:exported="true"
-            android:targetActivity=".presentation.MainActivity"
-            android:permission="android.permission.START_VIEW_PERMISSION_USAGE">
+            android:permission="android.permission.START_VIEW_PERMISSION_USAGE"
+            android:targetActivity=".presentation.MainActivity">
             <intent-filter>
                 <action android:name="android.intent.action.VIEW_PERMISSION_USAGE" />
                 <category android:name="android.intent.category.HEALTH_PERMISSIONS" />
@@ -114,8 +109,8 @@
 
         <service
             android:name="com.zegocloud.uikit.prebuilt.call.internal.ZegoService"
-            android:foregroundServiceType="microphone"
             android:exported="false"
+            android:foregroundServiceType="microphone"
             tools:node="replace" />
 
         <service

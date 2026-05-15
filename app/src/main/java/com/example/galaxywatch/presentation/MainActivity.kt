@@ -2,10 +2,14 @@ package com.example.galaxywatch.presentation
 
 import android.Manifest
 import android.app.Activity
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import android.view.ContextThemeWrapper
 import android.view.WindowManager
@@ -16,7 +20,18 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import com.example.galaxywatch.ZegoCallManager
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -25,7 +40,15 @@ import androidx.compose.material.icons.filled.AccessibilityNew
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.MonitorHeart
 import androidx.compose.material.icons.filled.Warning
-import androidx.compose.runtime.*
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -46,7 +69,10 @@ import androidx.health.connect.client.response.ReadRecordsResponse
 import androidx.health.connect.client.time.TimeRangeFilter
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import androidx.wear.compose.material.*
+import androidx.wear.compose.material.Icon
+import androidx.wear.compose.material.Scaffold
+import androidx.wear.compose.material.Text
+import androidx.wear.compose.material.TimeText
 import com.example.galaxywatch.BackgroundVitalsService
 import com.example.galaxywatch.SharedVitals
 import com.example.galaxywatch.presentation.theme.GalaxyWatchTheme
@@ -58,10 +84,6 @@ import com.samsung.android.service.health.tracking.HealthTrackingService
 import com.samsung.android.service.health.tracking.data.DataPoint
 import com.samsung.android.service.health.tracking.data.HealthTrackerType
 import com.samsung.android.service.health.tracking.data.ValueKey
-import com.zegocloud.uikit.prebuilt.call.ZegoUIKitPrebuiltCallConfig
-import com.zegocloud.uikit.prebuilt.call.invite.ZegoUIKitPrebuiltCallInvitationConfig
-import com.zegocloud.uikit.prebuilt.call.invite.ZegoUIKitPrebuiltCallInvitationService
-import com.zegocloud.uikit.prebuilt.call.invite.internal.ZegoUIKitPrebuiltCallConfigProvider
 import com.zegocloud.uikit.prebuilt.call.invite.widget.ZegoSendCallInvitationButton
 import com.zegocloud.uikit.service.defines.ZegoUIKitUser
 import kotlinx.coroutines.delay
@@ -122,11 +144,11 @@ class MainActivity : ComponentActivity() {
         val permissionLauncher = registerForActivityResult(
             ActivityResultContracts.RequestMultiplePermissions()
         ) { perms ->
-            if (perms[Manifest.permission.BODY_SENSORS] == true) {
-                checkHealthConnectPermissions()
-                startForegroundService(Intent(this, BackgroundVitalsService::class.java))
+            if (hasBodySensorsPermission()) {
+                startVitalsServiceIfPossible()
             }
-            if (perms[Manifest.permission.RECORD_AUDIO] != true) {
+
+            if (perms[Manifest.permission.RECORD_AUDIO] == false) {
                 Toast.makeText(this, "Mic required for SOS calls!", Toast.LENGTH_LONG).show()
             }
         }
@@ -153,17 +175,22 @@ class MainActivity : ComponentActivity() {
                 ) {
                     add(Manifest.permission.RECORD_AUDIO)
                 }
+
+                if (
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    ContextCompat.checkSelfPermission(
+                        this@MainActivity,
+                        Manifest.permission.POST_NOTIFICATIONS
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    add(Manifest.permission.POST_NOTIFICATIONS)
+                }
             }
 
             if (missing.isNotEmpty()) {
                 LaunchedEffect(Unit) { permissionLauncher.launch(missing.toTypedArray()) }
             } else {
-                LaunchedEffect(Unit) {
-                    checkHealthConnectPermissions()
-                    startForegroundService(
-                        Intent(this@MainActivity, BackgroundVitalsService::class.java)
-                    )
-                }
+                LaunchedEffect(Unit) { startVitalsServiceIfPossible() }
             }
 
             GalaxyWatchTheme { WearApp(this) }
@@ -195,12 +222,12 @@ class MainActivity : ComponentActivity() {
             HealthTrackerType::class.java
                 .getField("SPO2_CONTINUOUS")
                 .get(null) as? HealthTrackerType
-        } catch (e: NoSuchFieldException) {
+        } catch (_: NoSuchFieldException) {
             try {
                 HealthTrackerType::class.java
                     .getField("SPO2")
                     .get(null) as? HealthTrackerType
-            } catch (e2: NoSuchFieldException) {
+            } catch (_: NoSuchFieldException) {
                 Log.w("SPO2_SDK", "No SPO2 tracker available on this SDK")
                 null
             }
@@ -226,7 +253,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                override fun onFlushCompleted() {}
+                override fun onFlushCompleted() = Unit
 
                 override fun onError(e: HealthTracker.TrackerError?) {
                     Log.e("SPO2_SDK", "Tracker error: $e")
@@ -245,39 +272,47 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun initZegoCloud() {
-        val prefs = getSharedPreferences("ElderCarePrefs", Context.MODE_PRIVATE)
-        val patientId = prefs.getString("PATIENT_ID", "patient_001") ?: "patient_001"
-
-        val invitationConfig = ZegoUIKitPrebuiltCallInvitationConfig()
-        val notifConfig = com.zegocloud.uikit.prebuilt.call.config.ZegoNotificationConfig()
-        notifConfig.sound = "zego_uikit_sound_call"
-        notifConfig.channelID = "CallInvitation"
-        notifConfig.channelName = "CallInvitation"
-        invitationConfig.notificationConfig = notifConfig
-        invitationConfig.provider = ZegoUIKitPrebuiltCallConfigProvider { _ ->
-            ZegoUIKitPrebuiltCallConfig.oneOnOneVoiceCall().also {
-                it.useSpeakerWhenJoining = true
-                it.turnOnMicrophoneWhenJoining = true
-                it.topMenuBarConfig.isVisible = false
-            }
-        }
-
-        ZegoUIKitPrebuiltCallInvitationService.init(
-            application,
-            1279737711L,
-            "50a1c85a028c5224b00ec060afda1e71159d4cfdc124e124c441a981d83cd289",
-            patientId,
-            "Patient ($patientId)",
-            invitationConfig
-        )
+        val initialized = ZegoCallManager.ensureInitialized(applicationContext)
+        Log.d("ZEGO_INIT", "Call service initialized: $initialized")
     }
 
     override fun onDestroy() {
         super.onDestroy()
         stopSpo2SdkTracker()
-        ZegoUIKitPrebuiltCallInvitationService.unInit()
         captureManager?.release()
         healthTrackingService?.disconnectService()
+    }
+
+    private fun hasBodySensorsPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.BODY_SENSORS
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun startVitalsServiceIfPossible() {
+        if (!hasBodySensorsPermission()) return
+
+        checkHealthConnectPermissions()
+        ensureFullScreenIntentAccess()
+
+        if (!BackgroundVitalsService.isRunning) {
+            startForegroundService(Intent(this, BackgroundVitalsService::class.java))
+        }
+    }
+
+    private fun ensureFullScreenIntentAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            if (!notificationManager.canUseFullScreenIntent()) {
+                startActivity(
+                    Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT).apply {
+                        data = Uri.parse("package:$packageName")
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                )
+            }
+        }
     }
 
     private fun checkHealthConnectPermissions() {
@@ -304,7 +339,7 @@ fun WearApp(activity: MainActivity) {
     val healthClient = remember {
         try {
             HealthConnectClient.getOrCreate(context)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             null
         }
     }
@@ -319,6 +354,39 @@ fun WearApp(activity: MainActivity) {
 
     var isLogging by remember { mutableStateOf(false) }
     var loggingCountdown by remember { mutableStateOf(0) }
+
+    var rawRecordingLabel by remember { mutableStateOf<String?>(null) }
+    var rawRecordingCountdown by remember { mutableStateOf(0) }
+
+    fun startRawRecording(label: String) {
+        if (rawRecordingCountdown > 0) {
+            Toast.makeText(context, "Recording already in progress...", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        context.startService(
+            Intent(context, BackgroundVitalsService::class.java).apply {
+                action = BackgroundVitalsService.ACTION_START_RAW_RECORDING
+                putExtra(BackgroundVitalsService.EXTRA_RAW_LABEL, label)
+                putExtra(BackgroundVitalsService.EXTRA_RAW_DURATION_MS, 30_000L)
+            }
+        )
+
+        rawRecordingLabel = label
+        rawRecordingCountdown = 30
+
+        scope.launch {
+            for (i in 30 downTo 1) {
+                rawRecordingCountdown = i
+                delay(1000L)
+            }
+
+            rawRecordingCountdown = 0
+            rawRecordingLabel = null
+
+            Toast.makeText(context, "Raw motion CSV saved", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     DisposableEffect(lifecycleOwner) {
         val obs = LifecycleEventObserver { _, event ->
@@ -377,7 +445,7 @@ fun WearApp(activity: MainActivity) {
                         bpState = bpState,
                         onTap = {
                             if (bpState is BpState.Measuring) {
-                                Toast.makeText(context, "Already measuring…", Toast.LENGTH_SHORT)
+                                Toast.makeText(context, "Already measuring...", Toast.LENGTH_SHORT)
                                     .show()
                                 return@BpCard
                             }
@@ -385,7 +453,7 @@ fun WearApp(activity: MainActivity) {
                             if (activity.captureManager == null) {
                                 Toast.makeText(
                                     context,
-                                    "Sensor connecting, please wait…",
+                                    "Sensor connecting, please wait...",
                                     Toast.LENGTH_LONG
                                 ).show()
                                 return@BpCard
@@ -489,7 +557,7 @@ fun WearApp(activity: MainActivity) {
                                                 "--"
                                             }
                                             spo2 = if (lastKnown == "No Data") "--" else lastKnown
-                                            Log.d("SPO2", "Poll timed out — last known: $spo2")
+                                            Log.d("SPO2", "Poll timed out - last known: $spo2")
                                         }
 
                                         context.startService(
@@ -532,6 +600,14 @@ fun WearApp(activity: MainActivity) {
                         )
                     }
                 }
+
+//                RawMotionRecorderCard(
+//                    activeLabel = rawRecordingLabel,
+//                    countdown = rawRecordingCountdown,
+//                    onStill = { startRawRecording("still") },
+//                    onMove = { startRawRecording("hand_movement") },
+//                    onFall = { startRawRecording("fall_like") }
+//                )
             }
 
             Column(
@@ -568,6 +644,112 @@ fun WearApp(activity: MainActivity) {
 }
 
 @Composable
+fun RawMotionRecorderCard(
+    activeLabel: String?,
+    countdown: Int,
+    onStill: () -> Unit,
+    onMove: () -> Unit,
+    onFall: () -> Unit
+) {
+    val isRecording = countdown > 0
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (isRecording) AccentPurple.copy(alpha = 0.15f) else CardBg)
+            .border(
+                1.dp,
+                if (isRecording) AccentPurple else DividerColor,
+                RoundedCornerShape(12.dp)
+            )
+            .padding(6.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                text = "Raw Motion Recorder",
+                fontSize = 8.sp,
+                color = TextSecondary
+            )
+
+            Text(
+                text = if (isRecording) {
+                    "Recording $activeLabel... ${countdown}s"
+                } else {
+                    "Select motion type"
+                },
+                fontSize = 8.sp,
+                fontWeight = FontWeight.Bold,
+                color = if (isRecording) AccentPurple else TextSecondary,
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(Modifier.height(5.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                RawRecordButton(
+                    modifier = Modifier.weight(1f),
+                    text = "STILL",
+                    enabled = !isRecording,
+                    color = AccentGreen,
+                    onClick = onStill
+                )
+
+                RawRecordButton(
+                    modifier = Modifier.weight(1f),
+                    text = "MOVE",
+                    enabled = !isRecording,
+                    color = AccentBlue,
+                    onClick = onMove
+                )
+
+                RawRecordButton(
+                    modifier = Modifier.weight(1f),
+                    text = "FALL",
+                    enabled = !isRecording,
+                    color = AccentRed,
+                    onClick = onFall
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun RawRecordButton(
+    modifier: Modifier = Modifier,
+    text: String,
+    enabled: Boolean,
+    color: Color,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(
+                if (enabled) color.copy(alpha = 0.9f)
+                else DividerColor
+            )
+            .clickable(enabled = enabled) { onClick() }
+            .padding(horizontal = 4.dp, vertical = 5.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = text,
+            fontSize = 8.sp,
+            fontWeight = FontWeight.Bold,
+            color = TextPrimary,
+            textAlign = TextAlign.Center
+        )
+    }
+}
+
+@Composable
 fun GestureLoggerCard(
     isLogging: Boolean,
     countdown: Int,
@@ -594,7 +776,7 @@ fun GestureLoggerCard(
                 Text(text = "Gesture Logger", fontSize = 8.sp, color = TextSecondary)
                 if (isLogging) {
                     Text(
-                        text = "Recording… ${countdown}s left",
+                        text = "Recording... ${countdown}s left",
                         fontSize = 9.sp,
                         fontWeight = FontWeight.Bold,
                         color = AccentPurple
@@ -698,7 +880,7 @@ private suspend fun runBpMeasurement(
 
     if (peaks.size < 5) {
         onState(BpState.TooNoisy)
-        Log.w("BP_MEASURE", "Too few peaks (${peaks.size}) — signal too noisy")
+        Log.w("BP_MEASURE", "Too few peaks (${peaks.size}) - signal too noisy")
         return
     }
 
@@ -728,10 +910,10 @@ private suspend fun runBpMeasurement(
     val dbpRaw =
         ((-0.7776 * hr) + (-110.2632 * ibiSec) + (0.000926 * amplitude) + 221.5346).toInt()
 
-    val sbp = sbpRaw.coerceIn(60, 220)
+    val sbp = (sbpRaw - 5).coerceIn(60, 220)
     val dbp = dbpRaw.coerceIn(40, 140)
 
-    Log.d("BP_MEASURE", "HR=${hr}bpm IBI=${ibiSec}s HRV=${hrv}ms → SBP=$sbp DBP=$dbp")
+    Log.d("BP_MEASURE", "HR=${hr}bpm IBI=${ibiSec}s HRV=${hrv}ms -> SBP=$sbp DBP=$dbp")
 
     val category = classifyBp(sbp, dbp)
     onState(BpState.Result(sbp, dbp, category))
@@ -763,7 +945,7 @@ fun saveBpToFirebase(context: Context, sbp: Int, dbp: Int, category: BpCategory)
 
     patientRef.collection("blood_pressure").document(timestamp.toString()).set(historyData)
         .addOnSuccessListener {
-            Log.d("BP_FIREBASE", "✅ Saved BP: $bpString (${category.label})")
+            Log.d("BP_FIREBASE", "Saved BP: $bpString (${category.label})")
         }
         .addOnFailureListener { e ->
             Log.e("BP_FIREBASE", "History save failed: ${e.message}")
@@ -902,13 +1084,13 @@ fun exportDataToCsv(context: Context, data: List<SensorReading>) {
             context.getExternalFilesDir(null),
             "PPG_RawData_${System.currentTimeMillis()}.csv"
         )
-        FileWriter(file).use { w ->
-            w.append("Timestamp,PPG_Value\n")
+        FileWriter(file).use { writer ->
+            writer.append("Timestamp,PPG_Value\n")
             for (r in data) {
-                w.append("${r.timestamp},${r.value}\n")
+                writer.append("${r.timestamp},${r.value}\n")
             }
         }
-        Log.d("CSV_EXPORT", "✅ Saved: ${file.absolutePath}")
+        Log.d("CSV_EXPORT", "Saved: ${file.absolutePath}")
     } catch (e: Exception) {
         Log.e("CSV_EXPORT", "Failed to export CSV: ${e.message}")
     }
@@ -937,6 +1119,7 @@ fun launchSamsungHealthSpo2(context: Context) {
             )
             return
         } catch (_: Exception) {
+            Unit
         }
     }
 
@@ -955,6 +1138,7 @@ fun launchSamsungHealthSpo2(context: Context) {
             )
             return
         } catch (_: Exception) {
+            Unit
         }
     }
 

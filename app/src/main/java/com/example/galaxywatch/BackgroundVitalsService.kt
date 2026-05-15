@@ -1,7 +1,9 @@
 package com.example.galaxywatch
 
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -9,15 +11,16 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import com.example.galaxywatch.presentation.FallConfirmationActivity
 import com.google.firebase.firestore.SetOptions
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
-import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.MutableStateFlow
 import com.samsung.android.service.health.tracking.ConnectionListener
 import com.samsung.android.service.health.tracking.HealthTracker
 import com.samsung.android.service.health.tracking.HealthTrackerException
@@ -25,6 +28,14 @@ import com.samsung.android.service.health.tracking.HealthTrackingService
 import com.samsung.android.service.health.tracking.data.DataPoint
 import com.samsung.android.service.health.tracking.data.HealthTrackerType
 import com.samsung.android.service.health.tracking.data.ValueKey
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import org.tensorflow.lite.Interpreter
 import java.io.File
 import java.io.FileInputStream
@@ -43,8 +54,18 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         const val ACTION_STOP_LOGGING = "ACTION_STOP_LOGGING"
         const val ACTION_AUTO_RETURN = "ACTION_AUTO_RETURN"
 
+        // RAW DATA RECORDING ACTIONS
+        const val ACTION_START_RAW_RECORDING = "ACTION_START_RAW_RECORDING"
+        const val ACTION_STOP_RAW_RECORDING = "ACTION_STOP_RAW_RECORDING"
+        const val EXTRA_RAW_LABEL = "EXTRA_RAW_LABEL"
+        const val EXTRA_RAW_DURATION_MS = "EXTRA_RAW_DURATION_MS"
+
+        const val FALL_ALERT_NOTIFICATION_ID = 1001
+
+        private const val FALL_ALERT_CHANNEL_ID = "fall_alerts"
         private const val PREFS_SYSTEM_STATE = "SYSTEM_STATE"
         private const val KEY_SOS_ACTIVE = "SOS_ACTIVE"
+        private const val KEY_FALL_ALERT_ACTIVE = "FALL_ALERT_ACTIVE"
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -112,6 +133,40 @@ class BackgroundVitalsService : Service(), SensorEventListener {
     private val loggedWindows = mutableListOf<Pair<FloatArray, FloatArray>>()
     private val loggingLock = Any()
 
+    // RAW MOTION RECORDING STATE
+    private data class RawMotionSample(
+        val timestamp: Long,
+        val label: String,
+        val ax: Float,
+        val ay: Float,
+        val az: Float,
+        val accelMag: Float,
+        val gx: Float,
+        val gy: Float,
+        val gz: Float,
+        val gyroMag: Float
+    )
+
+    private val rawRecordingLock = Any()
+    private val rawSamples = mutableListOf<RawMotionSample>()
+
+    @Volatile
+    private var isRawRecording = false
+
+    @Volatile
+    private var rawRecordingLabel = "unlabeled"
+
+    @Volatile
+    private var latestGx = 0f
+
+    @Volatile
+    private var latestGy = 0f
+
+    @Volatile
+    private var latestGz = 0f
+
+    private var rawRecordingJob: Job? = null
+
     override fun onCreate() {
         super.onCreate()
         isRunning = true
@@ -157,6 +212,19 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                 return START_STICKY
             }
 
+            ACTION_START_RAW_RECORDING -> {
+                val label = intent.getStringExtra(EXTRA_RAW_LABEL) ?: "unlabeled"
+                val durationMs = intent.getLongExtra(EXTRA_RAW_DURATION_MS, 30_000L)
+
+                startRawRecording(label, durationMs)
+                return START_STICKY
+            }
+
+            ACTION_STOP_RAW_RECORDING -> {
+                stopRawRecordingAndSave()
+                return START_STICKY
+            }
+
             ACTION_TRIGGER_SOS -> {
                 startManualSosSuppression()
                 return START_STICKY
@@ -164,6 +232,9 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
             ACTION_CANCEL_FALL -> {
                 Log.d("FALL_AI", "User cancelled fall alert")
+                clearFallAlertState()
+                NotificationManagerCompat.from(this).cancel(FALL_ALERT_NOTIFICATION_ID)
+
                 fallSafetyTimeoutJob?.cancel()
                 fallSafetyTimeoutJob = null
 
@@ -182,6 +253,8 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
             ACTION_CONFIRM_FALL -> {
                 Log.d("FALL_AI", "Fall confirmed from confirmation flow")
+                clearFallAlertState()
+                NotificationManagerCompat.from(this).cancel(FALL_ALERT_NOTIFICATION_ID)
                 showConfirmedFallForOneMinute()
                 return START_STICKY
             }
@@ -221,7 +294,10 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         Log.d("SERVICE_DEBUG", "BackgroundVitalsService destroyed")
         isRunning = false
         super.onDestroy()
+
         autoReturnJob?.cancel()
+        rawRecordingJob?.cancel()
+
         serviceScope.cancel()
         sensorManager.unregisterListener(this)
         hrTracker?.unsetEventListener()
@@ -239,6 +315,30 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                 val ay = event.values[1]
                 val az = event.values[2]
                 val mag = Math.sqrt((ax * ax + ay * ay + az * az).toDouble()).toFloat()
+
+                // RAW RECORDING: Save ax, ay, az plus latest gx, gy, gz
+                if (isRawRecording) {
+                    val gyroMagNow = Math.sqrt(
+                        (latestGx * latestGx + latestGy * latestGy + latestGz * latestGz).toDouble()
+                    ).toFloat()
+
+                    synchronized(rawRecordingLock) {
+                        rawSamples.add(
+                            RawMotionSample(
+                                timestamp = System.currentTimeMillis(),
+                                label = rawRecordingLabel,
+                                ax = ax,
+                                ay = ay,
+                                az = az,
+                                accelMag = mag,
+                                gx = latestGx,
+                                gy = latestGy,
+                                gz = latestGz,
+                                gyroMag = gyroMagNow
+                            )
+                        )
+                    }
+                }
 
                 synchronized(bufferLock) {
                     if (bufferIndex < RAW_WINDOW) {
@@ -287,9 +387,15 @@ class BackgroundVitalsService : Service(), SensorEventListener {
 
             Sensor.TYPE_GYROSCOPE -> {
                 if (!isWatchOnWrist) return
+
                 val gx = event.values[0]
                 val gy = event.values[1]
                 val gz = event.values[2]
+
+                latestGx = gx
+                latestGy = gy
+                latestGz = gz
+
                 latestGyroMag = Math.sqrt((gx * gx + gy * gy + gz * gz).toDouble()).toFloat()
             }
 
@@ -308,7 +414,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         }
     }
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
     private fun linearResample(input: FloatArray, targetLen: Int): FloatArray {
         if (input.size == targetLen) return input.copyOf()
@@ -370,13 +476,13 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         }
 
         fun normalise(buf: FloatArray): FloatArray {
-            val m = buf.average().toFloat()
+            val mean = buf.average().toFloat()
             val std = kotlin.math.sqrt(
-                buf.map { ((it - m) * (it - m)).toDouble() }.average()
+                buf.map { ((it - mean) * (it - mean)).toDouble() }.average()
             ).toFloat()
 
             return if (std > 0f) {
-                FloatArray(MODEL_LEN) { i -> (buf[i] - m) / std }
+                FloatArray(MODEL_LEN) { i -> (buf[i] - mean) / std }
             } else {
                 buf.copyOf()
             }
@@ -420,9 +526,9 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                                 val recentG = gyroBuffer.slice(start until end)
 
                                 if (recentA.isNotEmpty()) {
-                                    val rm = recentA.average().toFloat()
+                                    val recentMean = recentA.average().toFloat()
                                     recentAccelVar = recentA
-                                        .map { (it - rm) * (it - rm) }
+                                        .map { (it - recentMean) * (it - recentMean) }
                                         .average()
                                         .toFloat()
                                 }
@@ -474,7 +580,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                                 }
 
                                 showConfirmedFallForOneMinute()
-                                launchFallConfirmationActivity()
+                                showFallConfirmationNotification()
                             }
                         }
                     }
@@ -485,6 +591,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                 }
 
                 else -> {
+                    Unit
                 }
             }
         } catch (e: Exception) {
@@ -518,6 +625,154 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         }
     }
 
+    private fun showFallConfirmationNotification() {
+        if (ignoreFallDetection || isManualSosActive || isSosActiveFromPrefs()) return
+
+        if (isFallAlertActive()) {
+            Log.d("FALL_AI", "Skipped - fall confirmation already active")
+            return
+        }
+
+        setFallAlertActive(true)
+
+        val fullScreenIntent = Intent(this, FallConfirmationActivity::class.java).apply {
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP
+            )
+        }
+
+        val fullScreenPendingIntent = PendingIntent.getActivity(
+            this,
+            2001,
+            fullScreenIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val cancelIntent = Intent(this, BackgroundVitalsService::class.java).apply {
+            action = ACTION_CANCEL_FALL
+        }
+
+        val cancelPendingIntent = PendingIntent.getService(
+            this,
+            2002,
+            cancelIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(this, FALL_ALERT_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setContentTitle("Fall detected")
+            .setContentText("Please confirm if you're okay.")
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOngoing(true)
+            .setAutoCancel(false)
+            .setContentIntent(fullScreenPendingIntent)
+            .setFullScreenIntent(fullScreenPendingIntent, true)
+            .addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "I'M OK",
+                cancelPendingIntent
+            )
+            .build()
+
+        try {
+            NotificationManagerCompat.from(this).notify(FALL_ALERT_NOTIFICATION_ID, notification)
+            Log.d("FALL_AI", "Fall confirmation notification posted")
+        } catch (e: SecurityException) {
+            clearFallAlertState()
+            Log.e("FALL_AI", "Notification permission denied: ${e.message}", e)
+        }
+    }
+
+    // RAW MOTION RECORDING FUNCTIONS
+    private fun startRawRecording(label: String, durationMs: Long = 30_000L) {
+        Log.d("RAW_RECORD", "Started raw recording: $label for ${durationMs}ms")
+
+        synchronized(rawRecordingLock) {
+            rawSamples.clear()
+        }
+
+        rawRecordingLabel = label
+        isRawRecording = true
+
+        rawRecordingJob?.cancel()
+        rawRecordingJob = serviceScope.launch {
+            delay(durationMs)
+            stopRawRecordingAndSave()
+        }
+    }
+
+    private fun stopRawRecordingAndSave() {
+        if (!isRawRecording) return
+
+        isRawRecording = false
+        rawRecordingJob?.cancel()
+        rawRecordingJob = null
+
+        val samplesToSave: List<RawMotionSample>
+
+        synchronized(rawRecordingLock) {
+            samplesToSave = rawSamples.toList()
+            rawSamples.clear()
+        }
+
+        if (samplesToSave.isEmpty()) {
+            Log.w("RAW_RECORD", "No raw samples captured")
+            return
+        }
+
+        serviceScope.launch {
+            saveRawMotionCsv(samplesToSave)
+        }
+    }
+
+    private fun saveRawMotionCsv(samples: List<RawMotionSample>) {
+        try {
+            val safeLabel = samples.firstOrNull()?.label
+                ?.replace(" ", "_")
+                ?.replace("/", "_")
+                ?.replace(",", "_")
+                ?: "unlabeled"
+
+            val file = File(
+                getExternalFilesDir(null),
+                "raw_motion_${safeLabel}_${System.currentTimeMillis()}.csv"
+            )
+
+            file.bufferedWriter().use { writer ->
+                writer.write("timestamp,label,ax,ay,az,accelMag,gx,gy,gz,gyroMag")
+                writer.newLine()
+
+                for (sample in samples) {
+                    val safeSampleLabel = sample.label.replace(",", "_")
+
+                    writer.write(
+                        "${sample.timestamp}," +
+                                "$safeSampleLabel," +
+                                "${sample.ax}," +
+                                "${sample.ay}," +
+                                "${sample.az}," +
+                                "${sample.accelMag}," +
+                                "${sample.gx}," +
+                                "${sample.gy}," +
+                                "${sample.gz}," +
+                                "${sample.gyroMag}"
+                    )
+                    writer.newLine()
+                }
+            }
+
+            Log.d("RAW_RECORD", "Saved ${samples.size} raw samples to ${file.absolutePath}")
+
+        } catch (e: Exception) {
+            Log.e("RAW_RECORD", "Failed to save raw motion CSV: ${e.message}", e)
+        }
+    }
+
     private fun saveLoggedData(label: Int) {
         val windows: List<Pair<FloatArray, FloatArray>>
         synchronized(loggingLock) {
@@ -535,15 +790,15 @@ class BackgroundVitalsService : Service(), SensorEventListener {
                 val filename = "gesture_log_label${label}_${System.currentTimeMillis()}.csv"
                 val file = File(getExternalFilesDir(null), filename)
 
-                file.bufferedWriter().use { w ->
+                file.bufferedWriter().use { writer ->
                     val accelCols = (0 until MODEL_LEN).joinToString(",") { "a$it" }
                     val gyroCols = (0 until MODEL_LEN).joinToString(",") { "g$it" }
-                    w.write("label,$accelCols,$gyroCols")
-                    w.newLine()
+                    writer.write("label,$accelCols,$gyroCols")
+                    writer.newLine()
 
                     for ((accel, gyro) in windows) {
-                        w.write("$label,${accel.joinToString(",")},${gyro.joinToString(",")}")
-                        w.newLine()
+                        writer.write("$label,${accel.joinToString(",")},${gyro.joinToString(",")}")
+                        writer.newLine()
                     }
                 }
 
@@ -599,7 +854,7 @@ class BackgroundVitalsService : Service(), SensorEventListener {
             }
         }
 
-        override fun onFlushCompleted() {}
+        override fun onFlushCompleted() = Unit
 
         override fun onError(e: HealthTracker.TrackerError?) {
             Log.e("HR_DEBUG", "Error: $e")
@@ -621,27 +876,14 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         }
     }
 
-    private fun launchFallConfirmationActivity() {
-        if (ignoreFallDetection || isManualSosActive || isSosActiveFromPrefs()) return
-
-        startActivity(
-            Intent(this, com.example.galaxywatch.presentation.FallConfirmationActivity::class.java)
-                .apply {
-                    addFlags(
-                        Intent.FLAG_ACTIVITY_NEW_TASK or
-                                Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                                Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                                Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
-                    )
-                }
-        )
-    }
-
     private fun startManualSosSuppression() {
         Log.d("SOS", "Suppression started")
         isManualSosActive = true
         ignoreFallDetection = true
         setSosActivePref(true)
+        clearFallAlertState()
+        NotificationManagerCompat.from(this).cancel(FALL_ALERT_NOTIFICATION_ID)
+
         isVerifying = false
         consecutiveHighScores = 0
         fallDetected = false
@@ -676,6 +918,20 @@ class BackgroundVitalsService : Service(), SensorEventListener {
         getSharedPreferences(PREFS_SYSTEM_STATE, Context.MODE_PRIVATE)
             .getBoolean(KEY_SOS_ACTIVE, false)
 
+    private fun setFallAlertActive(active: Boolean) =
+        getSharedPreferences(PREFS_SYSTEM_STATE, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_FALL_ALERT_ACTIVE, active)
+            .apply()
+
+    private fun isFallAlertActive() =
+        getSharedPreferences(PREFS_SYSTEM_STATE, Context.MODE_PRIVATE)
+            .getBoolean(KEY_FALL_ALERT_ACTIVE, false)
+
+    private fun clearFallAlertState() {
+        setFallAlertActive(false)
+    }
+
     private fun pushDataUpdates(forceFirebase: Boolean = false) {
         val now = System.currentTimeMillis()
 
@@ -699,25 +955,48 @@ class BackgroundVitalsService : Service(), SensorEventListener {
     }
 
     private fun acquireWakeLock() {
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ElderCare::VitalsWakeLock")
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "ElderCare::VitalsWakeLock"
+        )
         wakeLock?.setReferenceCounted(false)
         wakeLock?.acquire()
     }
 
     private fun startForegroundServiceNotification() {
-        val id = "VitalsServiceChannel_Silent"
-        getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(id, "Health Monitoring", NotificationManager.IMPORTANCE_LOW)
-                .apply {
+        val notificationManager = getSystemService(NotificationManager::class.java)
+        val serviceChannelId = "VitalsServiceChannel_Silent"
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            notificationManager.createNotificationChannel(
+                NotificationChannel(
+                    serviceChannelId,
+                    "Health Monitoring",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
                     enableVibration(false)
                     setSound(null, null)
                 }
-        )
+            )
+
+            notificationManager.createNotificationChannel(
+                NotificationChannel(
+                    FALL_ALERT_CHANNEL_ID,
+                    "Fall Alerts",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = "Urgent fall confirmation alerts"
+                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                    enableVibration(true)
+                    vibrationPattern = longArrayOf(0, 700, 300, 700, 300, 700)
+                }
+            )
+        }
 
         startForeground(
             1,
-            NotificationCompat.Builder(this, id)
+            NotificationCompat.Builder(this, serviceChannelId)
                 .setContentTitle("ElderCare Active")
                 .setContentText("Monitoring heart rate and fall detection...")
                 .setSmallIcon(android.R.drawable.ic_menu_info_details)

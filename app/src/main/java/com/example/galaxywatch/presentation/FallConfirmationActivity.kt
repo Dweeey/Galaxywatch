@@ -17,13 +17,19 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.runtime.*
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationManagerCompat
 import androidx.wear.compose.material.Button
 import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
@@ -43,13 +49,27 @@ class FallConfirmationActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        NotificationManagerCompat.from(this)
+            .cancel(BackgroundVitalsService.FALL_ALERT_NOTIFICATION_ID)
+
         val isSosActive = getSharedPreferences(PREFS_SYSTEM_STATE, Context.MODE_PRIVATE)
             .getBoolean(KEY_SOS_ACTIVE, false)
 
         if (isSosActive) {
             Log.d("FALL_UI", "Blocked FallConfirmationActivity due to SOS")
+            handled = true
+            startService(
+                Intent(this, BackgroundVitalsService::class.java).apply {
+                    action = BackgroundVitalsService.ACTION_CANCEL_FALL
+                }
+            )
             finish()
             return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
         }
 
         @Suppress("DEPRECATION")
@@ -60,7 +80,7 @@ class FallConfirmationActivity : ComponentActivity() {
                     WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
         )
 
-        vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        vibrator = getSystemService(Vibrator::class.java)
         triggerRepeatingVibration()
 
         setContent {
@@ -83,14 +103,12 @@ class FallConfirmationActivity : ComponentActivity() {
                         handled = true
                         stopVibration()
 
-                        // Confirm the fall first so UI stays on FALL DETECTED for 1 minute
                         startService(
                             Intent(this, BackgroundVitalsService::class.java).apply {
                                 action = BackgroundVitalsService.ACTION_CONFIRM_FALL
                             }
                         )
 
-                        // Go to SOS screen, but do NOT clear the fall state here
                         startActivity(
                             Intent(this, SosActivity::class.java).apply {
                                 addFlags(
@@ -126,6 +144,13 @@ class FallConfirmationActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        if (!handled) {
+            startService(
+                Intent(this, BackgroundVitalsService::class.java).apply {
+                    action = BackgroundVitalsService.ACTION_CANCEL_FALL
+                }
+            )
+        }
         stopVibration()
         super.onDestroy()
     }

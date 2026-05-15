@@ -1,66 +1,87 @@
 package com.example.galaxywatch.presentation
 
-import android.content.Context
 import android.os.Bundle
+import android.util.Log
 import android.view.ContextThemeWrapper
+import android.widget.Toast
 import androidx.activity.ComponentActivity
-import com.zegocloud.uikit.prebuilt.call.ZegoUIKitPrebuiltCallConfig
-import com.zegocloud.uikit.prebuilt.call.invite.ZegoUIKitPrebuiltCallInvitationConfig
-import com.zegocloud.uikit.prebuilt.call.invite.ZegoUIKitPrebuiltCallInvitationService
-import com.zegocloud.uikit.prebuilt.call.invite.internal.ZegoUIKitPrebuiltCallConfigProvider
+import androidx.lifecycle.lifecycleScope
+import com.example.galaxywatch.ZegoCallManager
 import com.zegocloud.uikit.prebuilt.call.invite.widget.ZegoSendCallInvitationButton
 import com.zegocloud.uikit.service.defines.ZegoUIKitUser
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 class SosActivity : ComponentActivity() {
+
+    private var retryCount = 0
+    private var sendSucceeded = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        initZegoCloud()
+        val ready = ZegoCallManager.ensureInitialized(applicationContext)
+        if (!ready) {
+            Toast.makeText(this, "SOS call service is not ready", Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
 
-        val themedContext = ContextThemeWrapper(this, android.R.style.Theme_DeviceDefault_NoActionBar)
+        val themedContext =
+            ContextThemeWrapper(this, android.R.style.Theme_DeviceDefault_NoActionBar)
 
         val sosButton = ZegoSendCallInvitationButton(themedContext).apply {
             setIsVideoCall(false)
-            setInvitees(listOf(ZegoUIKitUser("5yeapeXNTZcofATleG5ZHZ8siZt2", "Caregiver")))
+            setInvitees(
+                listOf(
+                    ZegoUIKitUser("5yeapeXNTZcofATleG5ZHZ8siZt2", "Caregiver")
+                )
+            )
+
+            showErrorToast(false)
+
+            // If you already configured ZEGO offline push, uncomment this and use your real resource ID.
+            // setResourceID("your_resource_id")
+
+            setOnClickListener { errorCode, errorMessage, errorInvitees ->
+                Log.d(
+                    "ZEGO_CALL",
+                    "SOS result code=$errorCode, message=$errorMessage, errorInvitees=$errorInvitees"
+                )
+
+                if (errorCode == 0) {
+                    sendSucceeded = true
+                    finish()
+                    return@setOnClickListener
+                }
+
+                if (retryCount < 1) {
+                    retryCount++
+                    lifecycleScope.launch {
+                        delay(1500L)
+                        performClick()
+                    }
+                } else {
+                    Toast.makeText(
+                        this@SosActivity,
+                        "SOS call failed: $errorCode $errorMessage",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    finish()
+                }
+            }
         }
 
-        sosButton.performClick()
-
-        finish()
+        lifecycleScope.launch {
+            delay(1500L)
+            sosButton.performClick()
+        }
     }
 
-    private fun initZegoCloud() {
-        val sharedPrefs = getSharedPreferences("ElderCarePrefs", Context.MODE_PRIVATE)
-        val patientId = sharedPrefs.getString("PATIENT_ID", "patient_001") ?: "patient_001"
-
-        val appID: Long = 1279737711L
-        val appSign = "50a1c85a028c5224b00ec060afda1e71159d4cfdc124e124c441a981d83cd289"
-
-        val callInvitationConfig = ZegoUIKitPrebuiltCallInvitationConfig()
-
-        val notificationConfig = com.zegocloud.uikit.prebuilt.call.config.ZegoNotificationConfig()
-        notificationConfig.sound = "zego_uikit_sound_call"
-        notificationConfig.channelID = "CallInvitation"
-        notificationConfig.channelName = "CallInvitation"
-
-        callInvitationConfig.notificationConfig = notificationConfig
-
-        callInvitationConfig.provider = ZegoUIKitPrebuiltCallConfigProvider { _ ->
-            val config = ZegoUIKitPrebuiltCallConfig.oneOnOneVoiceCall()
-            config.useSpeakerWhenJoining = true
-            config.turnOnMicrophoneWhenJoining = true
-            config.topMenuBarConfig.isVisible = false
-            config
+    override fun onDestroy() {
+        super.onDestroy()
+        if (!sendSucceeded) {
+            Log.d("ZEGO_CALL", "SosActivity closed before SOS invitation succeeded")
         }
-
-        ZegoUIKitPrebuiltCallInvitationService.init(
-            application,
-            appID,
-            appSign,
-            patientId,
-            "Patient ($patientId)",
-            callInvitationConfig
-        )
     }
 }
